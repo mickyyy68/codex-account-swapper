@@ -22,6 +22,8 @@ function usage() {
   cdx save <name>                   Save current ~/.codex/auth.json as a named account
   cdx use <name>                    Activate a named account
   cdx switch                        Switch to next configured account
+  cdx swap                          Alias for 'switch'
+  cdx remove <name>                 Remove a configured account
   cdx current                       Print active account name
   cdx list                          List configured accounts
   cdx help                          Show this help
@@ -64,6 +66,12 @@ function setActive(name) {
   fs.writeFileSync(ACTIVE_FILE, `${name}\n`, "utf8");
 }
 
+function clearActive() {
+  if (fs.existsSync(ACTIVE_FILE)) {
+    fs.rmSync(ACTIVE_FILE, { force: true });
+  }
+}
+
 function upsertAccount(accounts, name, accountPath) {
   let found = false;
   const next = accounts.map((entry) => {
@@ -83,8 +91,22 @@ function findAccount(accounts, name) {
   return accounts.find((entry) => entry.name === name);
 }
 
+function isRegularFile(filePath) {
+  try {
+    return fs.existsSync(filePath) && fs.statSync(filePath).isFile();
+  } catch (_) {
+    return false;
+  }
+}
+
+function isManagedSnapshot(filePath) {
+  const snapshotRoot = path.resolve(CDX_DIR, "auth");
+  const resolvedPath = path.resolve(filePath);
+  return resolvedPath.startsWith(`${snapshotRoot}${path.sep}`);
+}
+
 function applyAuthFile(sourceAuth) {
-  if (!fs.existsSync(sourceAuth) || !fs.statSync(sourceAuth).isFile()) {
+  if (!isRegularFile(sourceAuth)) {
     die(`auth file does not exist: ${sourceAuth}`);
   }
 
@@ -106,7 +128,7 @@ function cmdAdd(args) {
   }
   const [name, rawPath] = args;
   const fullPath = path.resolve(rawPath);
-  if (!fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) {
+  if (!isRegularFile(fullPath)) {
     die(`auth file not found: ${fullPath}`);
   }
 
@@ -124,7 +146,7 @@ function cmdSave(args) {
   }
   const [name] = args;
 
-  if (!fs.existsSync(TARGET_AUTH) || !fs.statSync(TARGET_AUTH).isFile()) {
+  if (!isRegularFile(TARGET_AUTH)) {
     die(`no current auth found at ${TARGET_AUTH}. Run 'codex login' first.`);
   }
 
@@ -219,6 +241,42 @@ function cmdSwitch(args) {
   process.stdout.write(`Switched to account '${next.name}'\n`);
 }
 
+function cmdRemove(args) {
+  if (args.length !== 1) {
+    die("remove requires <name>");
+  }
+  const [name] = args;
+  const accounts = readAccounts();
+  const removed = findAccount(accounts, name);
+  if (!removed) {
+    die(`unknown account: ${name}`);
+  }
+
+  const remaining = accounts.filter((entry) => entry.name !== name);
+  writeAccounts(remaining);
+
+  if (isManagedSnapshot(removed.path) && isRegularFile(removed.path)) {
+    fs.rmSync(removed.path, { force: true });
+  }
+
+  const active = getActive();
+  if (active !== name) {
+    process.stdout.write(`Removed account '${name}'\n`);
+    return;
+  }
+
+  const next = remaining.find((entry) => isRegularFile(entry.path));
+  if (!next) {
+    clearActive();
+    process.stdout.write(`Removed account '${name}'. No active account remains.\n`);
+    return;
+  }
+
+  applyAuthFile(next.path);
+  setActive(next.name);
+  process.stdout.write(`Removed account '${name}'. Switched to '${next.name}'.\n`);
+}
+
 function main() {
   const args = process.argv.slice(2);
   const command = args[0] || "help";
@@ -243,6 +301,12 @@ function main() {
       break;
     case "switch":
       cmdSwitch(rest);
+      break;
+    case "swap":
+      cmdSwitch(rest);
+      break;
+    case "remove":
+      cmdRemove(rest);
       break;
     case "current":
       cmdCurrent(rest);

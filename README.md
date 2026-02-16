@@ -61,6 +61,8 @@ cdx list
 cdx current
 cdx use work
 cdx switch
+cdx swap
+cdx remove work
 ```
 
 ## How It Works

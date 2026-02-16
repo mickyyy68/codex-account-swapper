@@ -19,6 +19,8 @@ Usage:
   cdx save <name>                   Save current ~/.codex/auth.json as a named account
   cdx use <name>                    Activate a named account
   cdx switch                        Switch to next configured account
+  cdx swap                          Alias for 'switch'
+  cdx remove <name>                 Remove a configured account
   cdx current                       Print active account name
   cdx list                          List configured accounts
   cdx help                          Show this help
@@ -52,6 +54,10 @@ get_active() {
 
 set_active() {
   printf "%s\n" "$1" > "$ACTIVE_FILE"
+}
+
+clear_active() {
+  rm -f "$ACTIVE_FILE"
 }
 
 get_account_path() {
@@ -223,6 +229,64 @@ cmd_switch() {
   cmd_use "$next_name"
 }
 
+cmd_remove() {
+  [ $# -eq 1 ] || die "remove requires <name>"
+  local target="$1"
+  local tmp_file
+  local active
+  local name path
+  local removed=0
+  local removed_path=""
+  local next_name=""
+  local next_path=""
+
+  tmp_file="${ACCOUNTS_FILE}.tmp"
+  : > "$tmp_file"
+  active="$(get_active)"
+
+  while IFS=$'\t' read -r name path || [ -n "${name:-}" ]; do
+    [ -z "${name:-}" ] && continue
+    if [ "$name" = "$target" ]; then
+      removed=1
+      removed_path="$path"
+      continue
+    fi
+    printf "%s\t%s\n" "$name" "$path" >> "$tmp_file"
+    if [ -z "$next_name" ] && [ -f "$path" ]; then
+      next_name="$name"
+      next_path="$path"
+    fi
+  done < "$ACCOUNTS_FILE"
+
+  [ "$removed" -eq 1 ] || {
+    rm -f "$tmp_file"
+    die "unknown account: $target"
+  }
+
+  mv "$tmp_file" "$ACCOUNTS_FILE"
+
+  case "$removed_path" in
+    "$CDX_DIR"/auth/*)
+      rm -f "$removed_path"
+      ;;
+  esac
+
+  if [ "$active" != "$target" ]; then
+    printf "Removed account '%s'\n" "$target"
+    return
+  fi
+
+  if [ -n "$next_name" ]; then
+    apply_auth_file "$next_path"
+    set_active "$next_name"
+    printf "Removed account '%s'. Switched to '%s'.\n" "$target" "$next_name"
+    return
+  fi
+
+  clear_active
+  printf "Removed account '%s'. No active account remains.\n" "$target"
+}
+
 main() {
   local cmd="${1:-help}"
 
@@ -251,6 +315,14 @@ main() {
     switch)
       shift
       cmd_switch "$@"
+      ;;
+    swap)
+      shift
+      cmd_switch "$@"
+      ;;
+    remove)
+      shift
+      cmd_remove "$@"
       ;;
     current)
       shift
