@@ -18,6 +18,7 @@ Usage:
   cdx add <name> <auth_json_path>   Register an account auth file
   cdx save <name>                   Save current ~/.codex/auth.json as a named account
   cdx use <name>                    Activate a named account
+  cdx rename <old> <new>            Rename a configured account
   cdx switch                        Switch to next configured account
   cdx swap <a> <b>                  Swap two accounts by index (1-based) or name
   cdx remove <name>                 Remove a configured account
@@ -158,6 +159,55 @@ cmd_use() {
   apply_auth_file "$path"
   set_active "$name"
   printf "Switched to account '%s'\n" "$name"
+}
+
+cmd_rename() {
+  [ $# -eq 2 ] || die "rename requires <old> <new>"
+  local old_name="$1"
+  local new_name="$2"
+  local active
+  local name path
+  local has_old=0
+  local has_new=0
+  local tmp_file
+
+  while IFS=$'\t' read -r name path || [ -n "${name:-}" ]; do
+    [ -z "${name:-}" ] && continue
+    if [ "$name" = "$old_name" ]; then
+      has_old=1
+    fi
+    if [ "$name" = "$new_name" ]; then
+      has_new=1
+    fi
+  done < "$ACCOUNTS_FILE"
+
+  [ "$has_old" -eq 1 ] || die "unknown account: $old_name"
+
+  if [ "$old_name" = "$new_name" ]; then
+    printf "Rename target is the same account; nothing changed.\n"
+    return
+  fi
+
+  [ "$has_new" -eq 0 ] || die "account name already exists: $new_name"
+
+  tmp_file="${ACCOUNTS_FILE}.tmp"
+  : > "$tmp_file"
+  while IFS=$'\t' read -r name path || [ -n "${name:-}" ]; do
+    [ -z "${name:-}" ] && continue
+    if [ "$name" = "$old_name" ]; then
+      printf "%s\t%s\n" "$new_name" "$path" >> "$tmp_file"
+    else
+      printf "%s\t%s\n" "$name" "$path" >> "$tmp_file"
+    fi
+  done < "$ACCOUNTS_FILE"
+  mv "$tmp_file" "$ACCOUNTS_FILE"
+
+  active="$(get_active)"
+  if [ "$active" = "$old_name" ]; then
+    set_active "$new_name"
+  fi
+
+  printf "Renamed account '%s' to '%s'\n" "$old_name" "$new_name"
 }
 
 cmd_current() {
@@ -380,6 +430,10 @@ main() {
     use)
       shift
       cmd_use "$@"
+      ;;
+    rename)
+      shift
+      cmd_rename "$@"
       ;;
     switch)
       shift

@@ -21,6 +21,7 @@ function usage() {
   cdx add <name> <auth_json_path>   Register an account auth file
   cdx save <name>                   Save current ~/.codex/auth.json as a named account
   cdx use <name>                    Activate a named account
+  cdx rename <old> <new>            Rename a configured account
   cdx switch                        Switch to next configured account
   cdx swap <a> <b>                  Swap two accounts by index (1-based) or name
   cdx remove <name>                 Remove a configured account
@@ -199,6 +200,38 @@ function cmdUse(args) {
   process.stdout.write(`Switched to account '${name}'\n`);
 }
 
+function cmdRename(args) {
+  if (args.length !== 2) {
+    die("rename requires <old> <new>");
+  }
+
+  const [oldName, newName] = args;
+  const accounts = readAccounts();
+  const oldIndex = accounts.findIndex((entry) => entry.name === oldName);
+  if (oldIndex < 0) {
+    die(`unknown account: ${oldName}`);
+  }
+
+  if (oldName === newName) {
+    process.stdout.write("Rename target is the same account; nothing changed.\n");
+    return;
+  }
+
+  const collisionIndex = accounts.findIndex((entry) => entry.name === newName);
+  if (collisionIndex >= 0) {
+    die(`account name already exists: ${newName}`);
+  }
+
+  accounts[oldIndex] = { ...accounts[oldIndex], name: newName };
+  writeAccounts(accounts);
+
+  if (getActive() === oldName) {
+    setActive(newName);
+  }
+
+  process.stdout.write(`Renamed account '${oldName}' to '${newName}'\n`);
+}
+
 function cmdCurrent(args) {
   if (args.length !== 0) {
     die("current takes no arguments");
@@ -339,6 +372,9 @@ function main() {
       break;
     case "use":
       cmdUse(rest);
+      break;
+    case "rename":
+      cmdRename(rest);
       break;
     case "switch":
       cmdSwitch(rest);

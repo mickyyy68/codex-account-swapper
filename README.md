@@ -60,6 +60,7 @@ cdx switch
 cdx list
 cdx current
 cdx use work
+cdx rename work main
 cdx switch
 cdx swap 1 2
 cdx remove work
