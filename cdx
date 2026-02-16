@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CDX_DIR="${CDX_DIR:-$HOME/.cdx}"
+ACCOUNTS_FILE="$CDX_DIR/accounts.tsv"
+ACTIVE_FILE="$CDX_DIR/active"
+CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
+TARGET_AUTH="$CODEX_HOME_DIR/auth.json"
+
+die() {
+  printf "cdx: %s\n" "$1" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  cdx add <name> <auth_json_path>   Register an account auth file
+  cdx save <name>                   Save current ~/.codex/auth.json as a named account
+  cdx use <name>                    Activate a named account
+  cdx switch                        Switch to next configured account
+  cdx current                       Print active account name
+  cdx list                          List configured accounts
+  cdx help                          Show this help
+EOF
+}
+
+ensure_state() {
+  mkdir -p "$CDX_DIR"
+  touch "$ACCOUNTS_FILE"
+}
+
+abs_path() {
+  local input="$1"
+  if [ -d "$input" ]; then
+    (cd "$input" && pwd -P)
+    return 0
+  fi
+
+  local dir
+  local base
+  dir="$(dirname "$input")"
+  base="$(basename "$input")"
+  (cd "$dir" && printf "%s/%s\n" "$(pwd -P)" "$base")
+}
+
+get_active() {
+  if [ -f "$ACTIVE_FILE" ]; then
+    cat "$ACTIVE_FILE"
+  fi
+}
+
+set_active() {
+  printf "%s\n" "$1" > "$ACTIVE_FILE"
+}
+
+get_account_path() {
+  local wanted="$1"
+  local name path
+  while IFS=$'\t' read -r name path || [ -n "${name:-}" ]; do
+    [ -z "${name:-}" ] && continue
+    if [ "$name" = "$wanted" ]; then
+      printf "%s\n" "$path"
+      return 0
+    fi
+  done < "$ACCOUNTS_FILE"
+  return 1
+}
+
+upsert_account() {
+  local target_name="$1"
+  local target_path="$2"
+  local tmp_file
+  local found=0
+  local name path
+
+  tmp_file="${ACCOUNTS_FILE}.tmp"
+  : > "$tmp_file"
+
+  while IFS=$'\t' read -r name path || [ -n "${name:-}" ]; do
+    [ -z "${name:-}" ] && continue
+    if [ "$name" = "$target_name" ]; then
+      printf "%s\t%s\n" "$target_name" "$target_path" >> "$tmp_file"
+      found=1
+    else
+      printf "%s\t%s\n" "$name" "$path" >> "$tmp_file"
+    fi
+  done < "$ACCOUNTS_FILE"
+
+  if [ "$found" -eq 0 ]; then
+    printf "%s\t%s\n" "$target_name" "$target_path" >> "$tmp_file"
+  fi
+
+  mv "$tmp_file" "$ACCOUNTS_FILE"
+}
+
+apply_auth_file() {
+  local source_auth="$1"
+  [ -f "$source_auth" ] || die "auth file does not exist: $source_auth"
+
+  mkdir -p "$CODEX_HOME_DIR"
+  if [ -f "$TARGET_AUTH" ]; then
+    cp "$TARGET_AUTH" "$TARGET_AUTH.bak"
+  fi
+  cp "$source_auth" "$TARGET_AUTH"
+  chmod 600 "$TARGET_AUTH" 2>/dev/null || true
+}
+
+cmd_add() {
+  [ $# -eq 2 ] || die "add requires <name> <auth_json_path>"
+  local name="$1"
+  local raw_path="$2"
+  local full_path
+
+  full_path="$(abs_path "$raw_path")"
+  [ -f "$full_path" ] || die "auth file not found: $full_path"
+
+  upsert_account "$name" "$full_path"
+  if [ -z "$(get_active)" ]; then
+    set_active "$name"
+  fi
+
+  printf "Registered account '%s' -> %s\n" "$name" "$full_path"
+}
+
+cmd_save() {
+  [ $# -eq 1 ] || die "save requires <name>"
+  local name="$1"
+  local snapshot_dir="$CDX_DIR/auth"
+  local snapshot_file="$snapshot_dir/${name}.auth.json"
+
+  [ -f "$TARGET_AUTH" ] || die "no current auth found at $TARGET_AUTH. Run 'codex login' first."
+
+  mkdir -p "$snapshot_dir"
+  cp "$TARGET_AUTH" "$snapshot_file"
+  chmod 600 "$snapshot_file" 2>/dev/null || true
+  upsert_account "$name" "$snapshot_file"
+
+  if [ -z "$(get_active)" ]; then
+    set_active "$name"
+  fi
+
+  printf "Saved current auth as '%s'\n" "$name"
+}
+
+cmd_use() {
+  [ $# -eq 1 ] || die "use requires <name>"
+  local name="$1"
+  local path
+
+  path="$(get_account_path "$name")" || die "unknown account: $name"
+  apply_auth_file "$path"
+  set_active "$name"
+  printf "Switched to account '%s'\n" "$name"
+}
+
+cmd_current() {
+  local active
+  active="$(get_active)"
+  [ -n "$active" ] || die "no active account set"
+  printf "%s\n" "$active"
+}
+
+cmd_list() {
+  local active
+  local name path
+  local has_any=0
+
+  active="$(get_active)"
+
+  while IFS=$'\t' read -r name path || [ -n "${name:-}" ]; do
+    [ -z "${name:-}" ] && continue
+    has_any=1
+    if [ "$name" = "$active" ]; then
+      printf "* %s\t%s\n" "$name" "$path"
+    else
+      printf "  %s\t%s\n" "$name" "$path"
+    fi
+  done < "$ACCOUNTS_FILE"
+
+  if [ "$has_any" -eq 0 ]; then
+    printf "No accounts configured.\n"
+  fi
+}
+
+cmd_switch() {
+  [ $# -eq 0 ] || die "switch takes no arguments"
+  local active name path
+  local names=()
+  local idx=-1
+  local i next_index next_name
+
+  active="$(get_active)"
+
+  while IFS=$'\t' read -r name path || [ -n "${name:-}" ]; do
+    [ -z "${name:-}" ] && continue
+    names+=("$name")
+  done < "$ACCOUNTS_FILE"
+
+  [ "${#names[@]}" -gt 0 ] || die "no accounts configured. Use 'cdx add' or 'cdx save'."
+
+  if [ -z "$active" ]; then
+    next_name="${names[0]}"
+    cmd_use "$next_name"
+    return
+  fi
+
+  for i in "${!names[@]}"; do
+    if [ "${names[$i]}" = "$active" ]; then
+      idx="$i"
+      break
+    fi
+  done
+
+  if [ "$idx" -lt 0 ]; then
+    next_name="${names[0]}"
+    cmd_use "$next_name"
+    return
+  fi
+
+  next_index=$(( (idx + 1) % ${#names[@]} ))
+  next_name="${names[$next_index]}"
+  cmd_use "$next_name"
+}
+
+main() {
+  local cmd="${1:-help}"
+
+  case "$cmd" in
+    help|-h|--help)
+      usage
+      return
+      ;;
+  esac
+
+  ensure_state
+
+  case "$cmd" in
+    add)
+      shift
+      cmd_add "$@"
+      ;;
+    save)
+      shift
+      cmd_save "$@"
+      ;;
+    use)
+      shift
+      cmd_use "$@"
+      ;;
+    switch)
+      shift
+      cmd_switch "$@"
+      ;;
+    current)
+      shift
+      cmd_current "$@"
+      ;;
+    list)
+      shift
+      cmd_list "$@"
+      ;;
+    *)
+      die "unknown command: $cmd (run 'cdx help')"
+      ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,28 @@
+{
+  "name": "codex-account-switcher",
+  "version": "0.1.0",
+  "description": "Switch between multiple Codex CLI auth accounts with cdx switch",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "cdx": "bin/cdx.js",
+    "cxs": "bin/cdx.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test:smoke": "node bin/cdx.js help"
+  },
+  "keywords": [
+    "codex",
+    "openai",
+    "cli",
+    "account",
+    "switcher"
+  ]
+}
