@@ -22,7 +22,7 @@ function usage() {
   cdx save <name>                   Save current ~/.codex/auth.json as a named account
   cdx use <name>                    Activate a named account
   cdx switch                        Switch to next configured account
-  cdx swap                          Alias for 'switch'
+  cdx swap <a> <b>                  Swap two accounts by index (1-based) or name
   cdx remove <name>                 Remove a configured account
   cdx current                       Print active account name
   cdx list                          List configured accounts
@@ -89,6 +89,22 @@ function upsertAccount(accounts, name, accountPath) {
 
 function findAccount(accounts, name) {
   return accounts.find((entry) => entry.name === name);
+}
+
+function resolveAccountIndex(accounts, ref) {
+  if (/^[1-9]\d*$/.test(ref)) {
+    const oneBased = Number.parseInt(ref, 10);
+    if (oneBased < 1 || oneBased > accounts.length) {
+      die(`index out of range: ${ref}`);
+    }
+    return oneBased - 1;
+  }
+
+  const byName = accounts.findIndex((entry) => entry.name === ref);
+  if (byName < 0) {
+    die(`unknown account reference: ${ref}`);
+  }
+  return byName;
 }
 
 function isRegularFile(filePath) {
@@ -241,6 +257,31 @@ function cmdSwitch(args) {
   process.stdout.write(`Switched to account '${next.name}'\n`);
 }
 
+function cmdSwap(args) {
+  if (args.length !== 2) {
+    die("swap requires <a> <b>");
+  }
+  const accounts = readAccounts();
+  if (accounts.length < 2) {
+    die("need at least 2 configured accounts to swap");
+  }
+
+  const firstIndex = resolveAccountIndex(accounts, args[0]);
+  const secondIndex = resolveAccountIndex(accounts, args[1]);
+
+  if (firstIndex === secondIndex) {
+    process.stdout.write("Swap target is the same account; nothing changed.\n");
+    return;
+  }
+
+  const firstName = accounts[firstIndex].name;
+  const secondName = accounts[secondIndex].name;
+  [accounts[firstIndex], accounts[secondIndex]] = [accounts[secondIndex], accounts[firstIndex]];
+  writeAccounts(accounts);
+
+  process.stdout.write(`Swapped '${firstName}' with '${secondName}'\n`);
+}
+
 function cmdRemove(args) {
   if (args.length !== 1) {
     die("remove requires <name>");
@@ -303,7 +344,7 @@ function main() {
       cmdSwitch(rest);
       break;
     case "swap":
-      cmdSwitch(rest);
+      cmdSwap(rest);
       break;
     case "remove":
       cmdRemove(rest);

@@ -19,7 +19,7 @@ Usage:
   cdx save <name>                   Save current ~/.codex/auth.json as a named account
   cdx use <name>                    Activate a named account
   cdx switch                        Switch to next configured account
-  cdx swap                          Alias for 'switch'
+  cdx swap <a> <b>                  Swap two accounts by index (1-based) or name
   cdx remove <name>                 Remove a configured account
   cdx current                       Print active account name
   cdx list                          List configured accounts
@@ -229,6 +229,75 @@ cmd_switch() {
   cmd_use "$next_name"
 }
 
+cmd_swap() {
+  [ $# -eq 2 ] || die "swap requires <a> <b>"
+  local first_ref="$1"
+  local second_ref="$2"
+  local name path i
+  local -a names=()
+  local -a paths=()
+  local first_idx=-1
+  local second_idx=-1
+  local first_name second_name tmp_name tmp_path
+
+  while IFS=$'\t' read -r name path || [ -n "${name:-}" ]; do
+    [ -z "${name:-}" ] && continue
+    names+=("$name")
+    paths+=("$path")
+  done < "$ACCOUNTS_FILE"
+
+  [ "${#names[@]}" -ge 2 ] || die "need at least 2 configured accounts to swap"
+
+  if [[ "$first_ref" =~ ^[1-9][0-9]*$ ]]; then
+    first_idx=$(( first_ref - 1 ))
+    [ "$first_idx" -ge 0 ] && [ "$first_idx" -lt "${#names[@]}" ] || die "index out of range: $first_ref"
+  else
+    for i in "${!names[@]}"; do
+      if [ "${names[$i]}" = "$first_ref" ]; then
+        first_idx="$i"
+        break
+      fi
+    done
+    [ "$first_idx" -ge 0 ] || die "unknown account reference: $first_ref"
+  fi
+
+  if [[ "$second_ref" =~ ^[1-9][0-9]*$ ]]; then
+    second_idx=$(( second_ref - 1 ))
+    [ "$second_idx" -ge 0 ] && [ "$second_idx" -lt "${#names[@]}" ] || die "index out of range: $second_ref"
+  else
+    for i in "${!names[@]}"; do
+      if [ "${names[$i]}" = "$second_ref" ]; then
+        second_idx="$i"
+        break
+      fi
+    done
+    [ "$second_idx" -ge 0 ] || die "unknown account reference: $second_ref"
+  fi
+
+  if [ "$first_idx" -eq "$second_idx" ]; then
+    printf "Swap target is the same account; nothing changed.\n"
+    return
+  fi
+
+  first_name="${names[$first_idx]}"
+  second_name="${names[$second_idx]}"
+
+  tmp_name="${names[$first_idx]}"
+  names[$first_idx]="${names[$second_idx]}"
+  names[$second_idx]="$tmp_name"
+
+  tmp_path="${paths[$first_idx]}"
+  paths[$first_idx]="${paths[$second_idx]}"
+  paths[$second_idx]="$tmp_path"
+
+  : > "$ACCOUNTS_FILE"
+  for i in "${!names[@]}"; do
+    printf "%s\t%s\n" "${names[$i]}" "${paths[$i]}" >> "$ACCOUNTS_FILE"
+  done
+
+  printf "Swapped '%s' with '%s'\n" "$first_name" "$second_name"
+}
+
 cmd_remove() {
   [ $# -eq 1 ] || die "remove requires <name>"
   local target="$1"
@@ -318,7 +387,7 @@ main() {
       ;;
     swap)
       shift
-      cmd_switch "$@"
+      cmd_swap "$@"
       ;;
     remove)
       shift
