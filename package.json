@@ -15,8 +15,13 @@
   "engines": {
     "node": ">=18"
   },
+  "dependencies": {
+    "@clack/prompts": "^1.2.0"
+  },
   "scripts": {
-    "test:smoke": "node bin/cdx.js help"
+    "test:smoke": "node -e 'const { spawnSync } = require(\"node:child_process\"); const r = spawnSync(process.execPath, [\"bin/cdx.js\"], { encoding: \"utf8\" }); const out = (r.stdout || \"\") + (r.stderr || \"\"); if (r.status !== 1) process.exit(1); if (!/interactive terminal required/i.test(out)) process.exit(1);'",
+    "test:regressions": "node tests/regressions.js",
+    "test": "npm run test:smoke && npm run test:regressions"
   },
   "keywords": [
     "codex",
