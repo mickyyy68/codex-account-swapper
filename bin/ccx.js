@@ -32,6 +32,7 @@ const {
 } = require("../lib/ccx/runtime");
 const {
   chooseFallbackAccount,
+  shouldAttemptFallbackAccount,
 } = require("../lib/ccx/fallback");
 const {
   resolvePendingPrompt,
@@ -65,9 +66,13 @@ const {
 const {
   formatStartupBanner,
 } = require("../lib/ccx/startup-ui");
+const {
+  ensureCurrentAuthRegistered,
+} = require("../lib/ccx/current-account");
 
 const CODEX_HOME_DIR = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const SESSIONS_DIR = path.join(CODEX_HOME_DIR, "sessions");
+const TARGET_AUTH = path.join(CODEX_HOME_DIR, "auth.json");
 const CDX_STATE_DIR = path.join(os.homedir(), ".cdx");
 const CCX_DEBUG_LOG = path.join(CDX_STATE_DIR, "ccx.log");
 const DISCOVERY_INTERVAL_MS = 250;
@@ -174,6 +179,13 @@ function createSupervisor() {
 async function main() {
   requireTTY();
   writeStatusLine(formatStartupBanner());
+  const bootstrap = ensureCurrentAuthRegistered({
+    cdxInternal,
+    currentAuthPath: TARGET_AUTH,
+  });
+  if (bootstrap.message) {
+    writeStatusLine(`[ccx] ${bootstrap.message}`);
+  }
 
   const forwardedArgs = process.argv.slice(2);
   const state = createSupervisor();
@@ -535,7 +547,9 @@ async function main() {
     }
 
     if (!result || !result.ok) {
-      const fallbackTarget = chooseFallbackAccount(cdxInternal.readAccounts(), result && result.from ? result.from : cdxInternal.getActive());
+      const fallbackTarget = shouldAttemptFallbackAccount(result)
+        ? chooseFallbackAccount(cdxInternal.readAccounts(), result && result.from ? result.from : cdxInternal.getActive())
+        : "";
       writeDebugLog("smart_switch_result", {
         ok: !!(result && result.ok),
         reason: result && result.reason ? result.reason : "",

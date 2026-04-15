@@ -239,6 +239,23 @@ await run("extracts email and plan type from direct fields and token claims", as
   });
 });
 
+await run("extracts account id from auth metadata", async () => {
+  const cdxDir = mkTempDir("cdx-test-account-id-");
+  const codexHome = mkTempDir("cdx-test-account-id-home-");
+  const authPath = path.join(cdxDir, "current.auth.json");
+
+  fs.mkdirSync(cdxDir, { recursive: true });
+  writeAuthSnapshot(authPath, "acct-metadata", "metadata@example.com", "plus");
+
+  await withEnv({ CDX_DIR: cdxDir, CODEX_HOME: codexHome }, async (internal) => {
+    assert.equal(
+      internal.extractAccountIdFromObject({ auth: { account_id: "acct-direct" } }),
+      "acct-direct",
+    );
+    assert.equal(internal.getAccountMetadata(authPath).accountId, "acct-metadata");
+  });
+});
+
 await run("formats rate limit windows into compact picker text", async () => {
   const cdxDir = mkTempDir("cdx-test-rate-limit-format-");
   const codexHome = mkTempDir("cdx-test-rate-limit-format-home-");
@@ -730,6 +747,58 @@ await run("reports all exhausted from smart switch operation", async () => {
     assert.equal(result.ok, false);
     assert.equal(result.allExhausted, true);
     assert.equal(result.reason, "all_exhausted");
+    assert.equal(result.to, "");
+  });
+});
+
+await run("reports an error when every eligible account is unavailable or exhausted", async () => {
+  const cdxDir = mkTempDir("cdx-test-smart-switch-unavailable-or-exhausted-");
+  const codexHome = mkTempDir("cdx-test-smart-switch-unavailable-or-exhausted-home-");
+  const authDir = path.join(cdxDir, "auth");
+  const accountsFile = path.join(cdxDir, "accounts.json");
+
+  fs.mkdirSync(authDir, { recursive: true });
+  const zeroAuth = path.join(authDir, "zero.auth.json");
+  const unavailableAuth = path.join(authDir, "unavailable.auth.json");
+  writeAuthSnapshot(zeroAuth, "acct-zero", "zero@example.com", "plus");
+  writeAuthSnapshot(unavailableAuth, "acct-unavailable", "unavailable@example.com", "plus");
+  fs.writeFileSync(
+    accountsFile,
+    JSON.stringify(
+      [
+        { name: "zero", path: zeroAuth },
+        { name: "unavailable", path: unavailableAuth },
+      ],
+      null,
+      2,
+    ),
+    "utf8",
+  );
+
+  await withEnv({ CDX_DIR: cdxDir, CODEX_HOME: codexHome }, async (internal) => {
+    internal.setLiveRateLimitFetcherForTests(async (accountPath) => {
+      if (accountPath === zeroAuth) {
+        return {
+          available: true,
+          email: "zero@example.com",
+          planType: "plus",
+          primary: { label: "5h", remainingPercent: 0, resetAt: "18:40", resetAtSeconds: 10 },
+          secondary: { label: "weekly", remainingPercent: 20, resetAt: "2039-09-18 18:40", resetAtSeconds: 100 },
+          credits: null,
+          errorCode: "",
+        };
+      }
+
+      return internal.createUnavailableRateLimitStatus(
+        { email: "unavailable@example.com", planType: "plus" },
+        "rate_limits_failed",
+      );
+    });
+
+    const result = await internal.runSmartSwitchOperation();
+    assert.equal(result.ok, false);
+    assert.equal(result.allExhausted, false);
+    assert.equal(result.reason, "all_unavailable_or_exhausted");
     assert.equal(result.to, "");
   });
 });

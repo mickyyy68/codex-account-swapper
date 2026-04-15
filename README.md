@@ -67,6 +67,7 @@ ccx
 Current behavior:
 - launches the real `codex` using your normal `~/.codex`
 - keeps Codex config, skills, sessions, and MCP setup intact
+- on startup, auto-registers the current auth as the first free numeric account if it is not saved yet
 - on `Enter`, checks the latest session rate limits before forwarding the prompt
 - if the active account is exhausted, runs `cdx smart-switch --json`
 - reopens the conversation with `codex fork <sessionId>`

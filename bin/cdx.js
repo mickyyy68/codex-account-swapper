@@ -389,6 +389,48 @@ function planTypeFromToken(tokenValue) {
   return "";
 }
 
+function extractAccountIdFromObject(input) {
+  if (!input || typeof input !== "object") {
+    return "";
+  }
+
+  const stack = [input];
+  const seen = new Set();
+
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node || typeof node !== "object") {
+      continue;
+    }
+    if (seen.has(node)) {
+      continue;
+    }
+    seen.add(node);
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        stack.push(item);
+      }
+      continue;
+    }
+
+    for (const [key, value] of Object.entries(node)) {
+      if (typeof value === "string") {
+        if (/^(account_id|accountId)$/i.test(key)) {
+          const accountId = value.trim();
+          if (accountId) {
+            return accountId;
+          }
+        }
+      } else if (value && typeof value === "object") {
+        stack.push(value);
+      }
+    }
+  }
+
+  return "";
+}
+
 function extractEmailFromObject(input) {
   if (!input || typeof input !== "object") {
     return "";
@@ -499,30 +541,32 @@ function getAccountMetadata(accountPath) {
     const stat = fs.statSync(accountPath);
     if (!stat.isFile()) {
       AUTH_METADATA_CACHE.delete(accountPath);
-      return { email: "", planType: "" };
+      return { accountId: "", email: "", planType: "" };
     }
 
     const cached = AUTH_METADATA_CACHE.get(accountPath);
     if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-      return { email: cached.email, planType: cached.planType };
+      return { accountId: cached.accountId, email: cached.email, planType: cached.planType };
     }
 
     const raw = fs.readFileSync(accountPath, "utf8");
     const parsed = JSON.parse(raw);
     const metadata = {
+      accountId: extractAccountIdFromObject(parsed),
       email: extractEmailFromObject(parsed),
       planType: extractPlanTypeFromObject(parsed),
     };
     AUTH_METADATA_CACHE.set(accountPath, {
       mtimeMs: stat.mtimeMs,
       size: stat.size,
+      accountId: metadata.accountId,
       email: metadata.email,
       planType: metadata.planType,
     });
     return metadata;
   } catch (_) {
     AUTH_METADATA_CACHE.delete(accountPath);
-    return { email: "", planType: "" };
+    return { accountId: "", email: "", planType: "" };
   }
 }
 
@@ -1467,6 +1511,15 @@ function areAllEligibleAccountsExhausted(entries, disabledName = "") {
   return available.length > 0 && available.every((entry) => statusNeedsHardWarning(entry.status));
 }
 
+function areAllEligibleAccountsUnavailableOrExhausted(entries, disabledName = "") {
+  const eligible = entries.filter(
+    (entry) => entry.account.name !== disabledName && entry.account.excludedFromRecommendation !== true,
+  );
+  return eligible.length > 0 &&
+    eligible.some((entry) => !(entry.status && entry.status.available)) &&
+    eligible.every((entry) => !(entry.status && entry.status.available) || statusNeedsHardWarning(entry.status));
+}
+
 function getResetSortValue(summary) {
   const raw = summary && Number(summary.resetAtSeconds);
   return Number.isFinite(raw) && raw > 0 ? raw : Number.POSITIVE_INFINITY;
@@ -1801,6 +1854,19 @@ function createStatusSnapshot(status) {
   };
 }
 
+function getSmartSwitchFailureMessage(result) {
+  if (result && result.reason === "all_unavailable_or_exhausted") {
+    return "All eligible accounts are exhausted or their limits are unavailable right now.";
+  }
+  if (result && result.reason === "all_exhausted") {
+    return "All eligible accounts are exhausted right now.";
+  }
+  if (result && result.reason === "no_accounts") {
+    return "No accounts configured.";
+  }
+  return "No smart-switch account is available.";
+}
+
 function getSmartSwitchDecisionFromSelection(selection, activeName) {
   const entries = selection && selection.entriesByName
     ? Array.from(selection.entriesByName.values())
@@ -1815,14 +1881,17 @@ function getSmartSwitchDecisionFromSelection(selection, activeName) {
 
   if (!recommendedEntry) {
     const allExhausted = areAllEligibleAccountsExhausted(entries);
+    const allUnavailableOrExhausted = areAllEligibleAccountsUnavailableOrExhausted(entries);
     return {
       ok: false,
       switched: false,
       alreadyOptimal: false,
-      allExhausted,
+      allExhausted: allExhausted && !allUnavailableOrExhausted,
       from: activeName || "",
       to: "",
-      reason: entries.length === 0 ? "no_accounts" : (allExhausted ? "all_exhausted" : "no_recommendation"),
+      reason: entries.length === 0
+        ? "no_accounts"
+        : (allUnavailableOrExhausted ? "all_unavailable_or_exhausted" : (allExhausted ? "all_exhausted" : "no_recommendation")),
       activeStatus: createStatusSnapshot(activeEntry ? activeEntry.status : null),
       recommendedStatus: null,
     };
@@ -2144,10 +2213,11 @@ async function runInteractive(migration) {
       const selection = await loadSwitchAccountSelection(p, accounts, activeName, "");
       const decision = getSmartSwitchDecisionFromSelection(selection, activeName);
       if (!decision.ok) {
-        if (decision.allExhausted) {
-          p.log.error("All eligible accounts are exhausted right now.");
+        const failureMessage = getSmartSwitchFailureMessage(decision);
+        if (decision.reason === "all_exhausted" || decision.reason === "all_unavailable_or_exhausted") {
+          p.log.error(failureMessage);
         } else {
-          p.log.warn("No smart-switch account is available.");
+          p.log.warn(failureMessage);
         }
         continue;
       }
@@ -2344,14 +2414,14 @@ async function main() {
         process.stdout.write(`Switched '${result.from}' -> '${result.to}'\n`);
       } else if (result.ok && result.alreadyOptimal) {
         process.stdout.write(`Already using smart account '${result.to}'\n`);
-      } else if (result.reason === "all_exhausted") {
-        process.stdout.write("All eligible accounts are exhausted right now.\n");
-      } else if (result.reason === "no_accounts") {
-        process.stdout.write("No accounts configured.\n");
       } else {
-        process.stdout.write("No smart-switch account is available.\n");
+        process.stdout.write(`${getSmartSwitchFailureMessage(result)}\n`);
       }
-      process.exit(result.ok ? 0 : (result.allExhausted ? 2 : 1));
+      process.exit(
+        result.ok
+          ? 0
+          : ((result.reason === "all_exhausted" || result.reason === "all_unavailable_or_exhausted") ? 2 : 1),
+      );
     } catch (err) {
       die(err.message || String(err));
     }
@@ -2385,9 +2455,11 @@ module.exports = {
     readAccountsFromJson,
     readAccounts,
     getActive,
+    setActive,
     repairAccountsState,
     repairAccountsStateOnDisk,
     formatRepairSummary,
+    extractAccountIdFromObject,
     extractEmailFromObject,
     extractPlanTypeFromObject,
     emailFromToken,
@@ -2410,6 +2482,7 @@ module.exports = {
     statusNeedsHardWarning,
     isStatusUsableNow,
     areAllEligibleAccountsExhausted,
+    areAllEligibleAccountsUnavailableOrExhausted,
     getCreditBalanceLabel,
     buildDepletedWarningMessage,
     createAppServerRequest,
@@ -2423,6 +2496,7 @@ module.exports = {
     getSmartSwitchDecisionFromSelection,
     createStatusSnapshot,
     runSmartSwitchOperation,
+    opSave,
     opUse,
     formatRateLimitHint,
     buildSwitchAccountLabel,

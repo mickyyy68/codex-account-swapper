@@ -27,6 +27,7 @@ const {
 } = require("../lib/ccx/runtime");
 const {
   chooseFallbackAccount,
+  shouldAttemptFallbackAccount,
 } = require("../lib/ccx/fallback");
 const {
   extractVisiblePromptDraft,
@@ -63,9 +64,35 @@ const {
 const {
   formatStartupBanner,
 } = require("../lib/ccx/startup-ui");
+const CDX_BIN_PATH = path.resolve(__dirname, "..", "bin", "cdx.js");
 
 function mkTempDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+async function withEnv(env, fn) {
+  const previous = new Map();
+  for (const [key, value] of Object.entries(env)) {
+    previous.set(key, process.env[key]);
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+  try {
+    delete require.cache[require.resolve(CDX_BIN_PATH)];
+    return await fn(require(CDX_BIN_PATH)._internal);
+  } finally {
+    for (const [key, value] of previous.entries()) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+    delete require.cache[require.resolve(CDX_BIN_PATH)];
+  }
 }
 
 async function run(name, fn) {
@@ -542,6 +569,164 @@ async function main() {
     assert.equal(account, "3");
   });
 
+  await run("does not allow blind fallback when accounts are unavailable or exhausted", async () => {
+    assert.equal(
+      shouldAttemptFallbackAccount({
+        ok: false,
+        allExhausted: false,
+        reason: "all_unavailable_or_exhausted",
+      }),
+      false,
+    );
+  });
+
+  await run("does not allow blind fallback when all accounts are exhausted", async () => {
+    assert.equal(
+      shouldAttemptFallbackAccount({
+        ok: false,
+        allExhausted: true,
+        reason: "all_exhausted",
+      }),
+      false,
+    );
+  });
+
+  await run("reuses an existing saved account when current auth matches by account id", async () => {
+    const { ensureCurrentAuthRegistered } = require("../lib/ccx/current-account");
+    const root = mkTempDir("ccx-test-current-account-match-");
+    const currentAuthPath = path.join(root, "current.auth.json");
+    const savedAuthPath = path.join(root, "saved.auth.json");
+    fs.writeFileSync(currentAuthPath, "{}", "utf8");
+    fs.writeFileSync(savedAuthPath, "{}", "utf8");
+
+    let savedName = "";
+    let activeName = "old";
+    const result = ensureCurrentAuthRegistered({
+      currentAuthPath,
+      cdxInternal: {
+        ensureState() {},
+        readAccounts() {
+          return [{ name: "7", path: savedAuthPath }];
+        },
+        getAccountMetadata(accountPath) {
+          return accountPath === currentAuthPath
+            ? { accountId: "acct-1", email: "match@example.com", planType: "plus" }
+            : { accountId: "acct-1", email: "saved@example.com", planType: "plus" };
+        },
+        getActive() {
+          return activeName;
+        },
+        setActive(name) {
+          activeName = name;
+        },
+        opSave(name) {
+          savedName = name;
+          return `Saved current auth as '${name}'`;
+        },
+      },
+    });
+
+    assert.equal(result.action, "matched");
+    assert.equal(result.name, "7");
+    assert.equal(savedName, "");
+    assert.equal(activeName, "7");
+  });
+
+  await run("saves current auth as the first free numeric account name", async () => {
+    const { ensureCurrentAuthRegistered } = require("../lib/ccx/current-account");
+    const root = mkTempDir("ccx-test-current-account-save-");
+    const currentAuthPath = path.join(root, "current.auth.json");
+    const firstAuthPath = path.join(root, "first.auth.json");
+    const thirdAuthPath = path.join(root, "third.auth.json");
+    fs.writeFileSync(currentAuthPath, "{}", "utf8");
+    fs.writeFileSync(firstAuthPath, "{}", "utf8");
+    fs.writeFileSync(thirdAuthPath, "{}", "utf8");
+
+    let savedName = "";
+    let activeName = "work";
+    const result = ensureCurrentAuthRegistered({
+      currentAuthPath,
+      cdxInternal: {
+        ensureState() {},
+        readAccounts() {
+          return [
+            { name: "1", path: firstAuthPath },
+            { name: "3", path: thirdAuthPath },
+            { name: "work", path: path.join(root, "work.auth.json") },
+          ];
+        },
+        getAccountMetadata(accountPath) {
+          if (accountPath === currentAuthPath) {
+            return { accountId: "acct-new", email: "new@example.com", planType: "plus" };
+          }
+          if (accountPath === firstAuthPath) {
+            return { accountId: "acct-1", email: "one@example.com", planType: "plus" };
+          }
+          if (accountPath === thirdAuthPath) {
+            return { accountId: "acct-3", email: "three@example.com", planType: "plus" };
+          }
+          return { accountId: "acct-work", email: "work@example.com", planType: "plus" };
+        },
+        getActive() {
+          return activeName;
+        },
+        setActive(name) {
+          activeName = name;
+        },
+        opSave(name) {
+          savedName = name;
+          return `Saved current auth as '${name}'`;
+        },
+      },
+    });
+
+    assert.equal(result.action, "saved");
+    assert.equal(result.name, "2");
+    assert.equal(result.message, "Saved current auth as '2'");
+    assert.equal(savedName, "2");
+    assert.equal(activeName, "2");
+  });
+
+  await run("uses real cdx internals to persist a newly discovered current auth", async () => {
+    const { ensureCurrentAuthRegistered } = require("../lib/ccx/current-account");
+    const cdxDir = mkTempDir("ccx-test-current-account-real-save-");
+    const codexHome = mkTempDir("ccx-test-current-account-real-save-home-");
+    const currentAuthPath = path.join(codexHome, "auth.json");
+    const firstAuthPath = path.join(cdxDir, "auth", "1.auth.json");
+
+    fs.mkdirSync(path.dirname(firstAuthPath), { recursive: true });
+    fs.writeFileSync(
+      path.join(cdxDir, "accounts.json"),
+      JSON.stringify([{ name: "1", path: firstAuthPath, pinned: false, excludedFromRecommendation: false }], null, 2),
+      "utf8",
+    );
+    fs.writeFileSync(path.join(cdxDir, "active"), "1\n", "utf8");
+    fs.writeFileSync(
+      firstAuthPath,
+      JSON.stringify({ account_id: "acct-1", user: { email: "one@example.com" } }, null, 2),
+      "utf8",
+    );
+    fs.writeFileSync(
+      currentAuthPath,
+      JSON.stringify({ account_id: "acct-2", user: { email: "two@example.com" } }, null, 2),
+      "utf8",
+    );
+
+    await withEnv({ CDX_DIR: cdxDir, CODEX_HOME: codexHome }, async (cdxInternal) => {
+      const result = ensureCurrentAuthRegistered({
+        cdxInternal,
+        currentAuthPath,
+      });
+
+      const accounts = cdxInternal.readAccounts();
+      assert.equal(result.action, "saved");
+      assert.equal(result.name, "2");
+      assert.deepEqual(accounts.map((entry) => entry.name), ["1", "2"]);
+      assert.equal(fs.existsSync(path.join(cdxDir, "auth", "2.auth.json")), true);
+      assert.equal(cdxInternal.getActive(), "2");
+    });
+  });
+
   await run("tracks draft input with append, backspace, and submit", async () => {
     let state = applyInputChunk("", "hel");
     assert.deepEqual(state, { draft: "hel", submitted: false, changed: true });
@@ -687,6 +872,17 @@ async function main() {
     const banner = formatFailureBanner("All eligible accounts are exhausted right now.");
     assert.match(banner, /\u001b\[1;31m/);
     assert.match(banner, /\[ccx\] All eligible accounts are exhausted right now\./);
+  });
+
+  await run("renders the unavailable-or-exhausted smart-switch error in ccx", async () => {
+    const banner = formatDecisionBanner({
+      ok: false,
+      allExhausted: false,
+      reason: "all_unavailable_or_exhausted",
+    });
+
+    assert.match(banner, /\u001b\[1;31m/);
+    assert.match(banner, /\[ccx\] All eligible accounts are exhausted or their limits are unavailable right now\./);
   });
 
   await run("highlights only user prompt lines with a subtle background", async () => {
