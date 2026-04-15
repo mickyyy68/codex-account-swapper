@@ -49,6 +49,9 @@ const {
 } = require("../lib/ccx/prefill");
 const {
   highlightUserPromptLines,
+  createUserPromptOutputTransformer,
+  ANSI_USER_PROMPT_BACKGROUND,
+  ANSI_RESET_BACKGROUND,
 } = require("../lib/ccx/output-style");
 
 function mkTempDir(prefix) {
@@ -555,6 +558,17 @@ async function main() {
     assert.match(output, /\u001b\[48;5;236m› leggi il progetto\u001b\[49m/);
     assert.match(output, /assistant output/);
     assert.doesNotMatch(output, /\u001b\[48;5;236massistant output\u001b\[49m/);
+  });
+
+  await run("keeps prompt highlighting when the user line arrives across multiple chunks", async () => {
+    const transformer = createUserPromptOutputTransformer();
+    const outputA = transformer.transform("header\nâ€º ");
+    const outputB = transformer.transform("leggi il progetto");
+    const outputC = transformer.transform("\nassistant output");
+
+    assert.equal(outputA, "header\n");
+    assert.match(outputB, /\u001b\[48;5;236mâ€º leggi il progetto\u001b\[49m/);
+    assert.equal(outputC, "\nassistant output");
   });
 
   await run("builds a terminal reset sequence that disables sticky tty modes", async () => {

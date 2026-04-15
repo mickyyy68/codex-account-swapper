@@ -45,6 +45,7 @@ const {
 } = require("../lib/ccx/prefill");
 const {
   highlightUserPromptLines,
+  createUserPromptOutputTransformer,
 } = require("../lib/ccx/output-style");
 const {
   formatSwitchingBanner,
@@ -322,6 +323,7 @@ async function main() {
     });
 
     state.ptyProcess = child;
+    const outputTransformer = createUserPromptOutputTransformer();
     const prefillController = createPrefillController({
       prefillText,
       autoSubmit: autoSubmitPrefill,
@@ -359,7 +361,7 @@ async function main() {
       }, 250);
     };
     child.onData((data) => {
-      process.stdout.write(highlightUserPromptLines(data));
+      process.stdout.write(outputTransformer.transform(data));
       state.outputBuffer = updateOutputBuffer(state.outputBuffer, data);
       updateSessionIdentityFromOutput();
       schedulePrefill();
@@ -373,6 +375,10 @@ async function main() {
         clearTimeout(fallbackPrefillTimer);
       }
       prefillController.clear();
+      const flushedOutput = outputTransformer.flush();
+      if (flushedOutput) {
+        process.stdout.write(flushedOutput);
+      }
       state.ptyProcess = null;
       if (wasSwitching || state.shuttingDown) {
         return;
