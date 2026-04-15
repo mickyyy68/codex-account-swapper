@@ -47,6 +47,9 @@ const {
   createPrefillController,
   PREFILL_AUTOSUBMIT_DELAY_MS,
 } = require("../lib/ccx/prefill");
+const {
+  highlightUserPromptLines,
+} = require("../lib/ccx/output-style");
 
 function mkTempDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -540,6 +543,18 @@ async function main() {
     const banner = formatFailureBanner("All eligible accounts are exhausted right now.");
     assert.match(banner, /\u001b\[1;31m/);
     assert.match(banner, /\[ccx\] All eligible accounts are exhausted right now\./);
+  });
+
+  await run("highlights only user prompt lines with a subtle background", async () => {
+    const output = highlightUserPromptLines([
+      "header",
+      "› leggi il progetto",
+      "assistant output",
+    ].join("\n"));
+
+    assert.match(output, /\u001b\[48;5;236m› leggi il progetto\u001b\[49m/);
+    assert.match(output, /assistant output/);
+    assert.doesNotMatch(output, /\u001b\[48;5;236massistant output\u001b\[49m/);
   });
 
   await run("builds a terminal reset sequence that disables sticky tty modes", async () => {

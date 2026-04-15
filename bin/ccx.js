@@ -44,6 +44,9 @@ const {
   createPrefillController,
 } = require("../lib/ccx/prefill");
 const {
+  highlightUserPromptLines,
+} = require("../lib/ccx/output-style");
+const {
   formatSwitchingBanner,
   formatDecisionBanner,
   formatFailureBanner,
@@ -356,7 +359,7 @@ async function main() {
       }, 250);
     };
     child.onData((data) => {
-      process.stdout.write(data);
+      process.stdout.write(highlightUserPromptLines(data));
       state.outputBuffer = updateOutputBuffer(state.outputBuffer, data);
       updateSessionIdentityFromOutput();
       schedulePrefill();
