@@ -35,6 +35,7 @@ const {
   applyInputChunk,
   chunkRequestsAbort,
   chunkRequestsEscape,
+  getForwardingChunks,
   getForwardingOverride,
   hasDraftText,
 } = require("../lib/ccx/input-buffer");
@@ -554,6 +555,15 @@ async function main() {
       "\u001b",
     );
     assert.equal(getForwardingOverride("leggi il progetto"), "");
+  });
+
+  await run("forwards both raw and plain ESC for win32 escape sequences", async () => {
+    assert.deepEqual(
+      getForwardingChunks("\u001b[27;1;0;1;0;1_\u001b[27;1;0;0;0;1_"),
+      ["\u001b[27;1;0;1;0;1_\u001b[27;1;0;0;0;1_", "\u001b"],
+    );
+    assert.deepEqual(getForwardingChunks("\u001b"), ["\u001b"]);
+    assert.deepEqual(getForwardingChunks("leggi il progetto"), ["leggi il progetto"]);
   });
 
   await run("extracts the latest visible prompt text from Codex output", async () => {

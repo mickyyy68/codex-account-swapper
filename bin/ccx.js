@@ -40,6 +40,7 @@ const {
   applyInputChunk,
   chunkRequestsAbort,
   chunkRequestsEscape,
+  getForwardingChunks,
   getForwardingOverride,
   hasDraftText,
 } = require("../lib/ccx/input-buffer");
@@ -580,14 +581,16 @@ async function main() {
     if (state.ptyProcess) {
       state.lastSubmittedPrompt = pendingPrompt;
       state.draftBuffer = "";
-      state.ptyProcess.write(text);
+      writeStatusLine(formatHighlightedUserPrompt(pendingPrompt));
+      for (const chunk of getForwardingChunks(text)) {
+        state.ptyProcess.write(chunk);
+      }
       armUsageLimitWatch(pendingPrompt);
     }
   }
 
   async function onInput(data) {
     const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
-    const forwardingOverride = getForwardingOverride(text);
     const escapeRequested = chunkRequestsEscape(text);
     if (chunkRequestsAbort(text)) {
       writeDebugLog("interrupt_exit", {
@@ -620,7 +623,9 @@ async function main() {
         draftBuffer: state.draftBuffer,
       });
       if (!pendingPrompt) {
-        state.ptyProcess.write(forwardingOverride || text);
+        for (const chunk of getForwardingChunks(text)) {
+          state.ptyProcess.write(chunk);
+        }
         return;
       }
       try {
@@ -632,7 +637,9 @@ async function main() {
       return;
     }
 
-    state.ptyProcess.write(forwardingOverride || text);
+    for (const chunk of getForwardingChunks(text)) {
+      state.ptyProcess.write(chunk);
+    }
   }
 
   process.stdin.setRawMode(true);
