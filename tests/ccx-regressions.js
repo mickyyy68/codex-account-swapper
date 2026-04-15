@@ -34,6 +34,7 @@ const {
 const {
   applyInputChunk,
   chunkRequestsAbort,
+  getForwardingOverride,
   hasDraftText,
 } = require("../lib/ccx/input-buffer");
 const {
@@ -53,6 +54,7 @@ const {
   createUserPromptOutputTransformer,
   ANSI_USER_PROMPT_BACKGROUND,
   ANSI_RESET_BACKGROUND,
+  formatHighlightedUserPrompt,
 } = require("../lib/ccx/output-style");
 
 function mkTempDir(prefix) {
@@ -529,6 +531,18 @@ async function main() {
     assert.equal(chunkRequestsAbort("leggi il progetto"), false);
   });
 
+  await run("forwards win32 escape as a plain ESC character", async () => {
+    assert.equal(
+      getForwardingOverride("\u001b[27;1;0;1;0;1_\u001b[27;1;0;0;0;1_"),
+      "\u001b",
+    );
+    assert.equal(
+      getForwardingOverride("\u001b[27;1;27;1;0;1_\u001b[27;1;27;0;0;1_"),
+      "\u001b",
+    );
+    assert.equal(getForwardingOverride("leggi il progetto"), "");
+  });
+
   await run("extracts the latest visible prompt text from Codex output", async () => {
     const prompt = extractVisiblePromptDraft(
       [
@@ -589,6 +603,16 @@ async function main() {
     assert.match(output, /\u001b\[48;5;236m› leggi il progetto\u001b\[49m/);
     assert.match(output, /assistant output/);
     assert.doesNotMatch(output, /\u001b\[48;5;236massistant output\u001b\[49m/);
+  });
+
+  await run("highlights prompt lines that use the real codex prompt symbol", async () => {
+    const output = highlightUserPromptLines("header\n› leggi il progetto\nassistant output");
+    assert.match(output, /\u001b\[48;5;236m› leggi il progetto\u001b\[49m/);
+  });
+
+  await run("formats an explicitly highlighted user prompt line", async () => {
+    const output = formatHighlightedUserPrompt("leggi il progetto");
+    assert.match(output, /\u001b\[48;5;236m› leggi il progetto\u001b\[49m/);
   });
 
   await run("keeps prompt highlighting when the user line arrives across multiple chunks", async () => {

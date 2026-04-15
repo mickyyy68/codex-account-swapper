@@ -39,6 +39,7 @@ const {
 const {
   applyInputChunk,
   chunkRequestsAbort,
+  getForwardingOverride,
   hasDraftText,
 } = require("../lib/ccx/input-buffer");
 const {
@@ -47,6 +48,7 @@ const {
 const {
   highlightUserPromptLines,
   createUserPromptOutputTransformer,
+  formatHighlightedUserPrompt,
 } = require("../lib/ccx/output-style");
 const {
   formatSwitchingBanner,
@@ -557,6 +559,7 @@ async function main() {
         state.lastSubmittedPrompt = submittedPrompt;
         state.draftBuffer = "";
         state.outputBuffer = "";
+        writeStatusLine(formatHighlightedUserPrompt(submittedPrompt));
         armUsageLimitWatch(submittedPrompt);
       },
     });
@@ -574,6 +577,7 @@ async function main() {
 
   async function onInput(data) {
     const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
+    const forwardingOverride = getForwardingOverride(text);
     if (chunkRequestsAbort(text)) {
       writeDebugLog("interrupt_exit", {
         switching: state.switching,
@@ -601,7 +605,7 @@ async function main() {
         draftBuffer: state.draftBuffer,
       });
       if (!pendingPrompt) {
-        state.ptyProcess.write(text);
+        state.ptyProcess.write(forwardingOverride || text);
         return;
       }
       try {
@@ -613,7 +617,7 @@ async function main() {
       return;
     }
 
-    state.ptyProcess.write(text);
+    state.ptyProcess.write(forwardingOverride || text);
   }
 
   process.stdin.setRawMode(true);
