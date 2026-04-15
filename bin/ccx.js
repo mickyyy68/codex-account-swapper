@@ -25,6 +25,7 @@ const {
   sleep,
   waitForPredicate,
   waitForTruthyValue,
+  waitForUsageLimitSignal,
   waitForChildExit,
 } = require("../lib/ccx/runtime");
 const {
@@ -250,26 +251,24 @@ async function main() {
       pendingPrompt,
     });
 
-    waitForPredicate(
+    waitForUsageLimitSignal(
       () => ({
         sessionState: readCurrentSessionState(),
         outputFallbackMatched: !state.sessionFilePath && outputLooksLikeUsageLimit(state.outputBuffer),
       }),
       {
-        timeoutMs: 6000,
-        intervalMs: 100,
-        predicate: (snapshot) => {
-          if (!snapshot || typeof snapshot !== "object") {
-            return false;
-          }
-          return snapshot.outputFallbackMatched || isSessionStateUsageLimitExceeded(snapshot.sessionState);
-        },
         stopWhen: () => (
           state.switching ||
           state.shuttingDown ||
           watchNonce !== state.usageLimitWatchNonce ||
           state.lastSubmittedPrompt !== pendingPrompt
         ),
+        isMatch: (snapshot) => {
+          if (!snapshot || typeof snapshot !== "object") {
+            return false;
+          }
+          return snapshot.outputFallbackMatched || isSessionStateUsageLimitExceeded(snapshot.sessionState);
+        },
       },
     ).then((result) => {
       writeDebugLog("usage_watch_completed", {

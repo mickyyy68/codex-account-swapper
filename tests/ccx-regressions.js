@@ -21,6 +21,7 @@ const {
 const {
   waitForTruthyValue,
   waitForPredicate,
+  waitForUsageLimitSignal,
 } = require("../lib/ccx/runtime");
 const {
   chooseFallbackAccount,
@@ -409,6 +410,36 @@ async function main() {
 
     assert.deepEqual(result, { sessionId: "sess-late", sessionFilePath: "C:\\session.jsonl" });
     assert.ok(reads >= 3);
+  });
+
+  await run("waits for a late usage-limit signal after a long discovery delay", async () => {
+    let reads = 0;
+    const result = await waitForUsageLimitSignal(
+      async () => {
+        reads += 1;
+        if (reads < 10) {
+          return { sessionState: null, outputFallbackMatched: false };
+        }
+        return {
+          sessionState: { latestError: { code: "usage_limit_exceeded" } },
+          outputFallbackMatched: false,
+        };
+      },
+      {
+        timeoutMs: 200,
+        intervalMs: 5,
+        isMatch: (snapshot) => Boolean(
+          snapshot &&
+          (
+            snapshot.outputFallbackMatched ||
+            (snapshot.sessionState && snapshot.sessionState.latestError && snapshot.sessionState.latestError.code === "usage_limit_exceeded")
+          )
+        ),
+      },
+    );
+
+    assert.equal(result.matched, true);
+    assert.ok(reads >= 10);
   });
 
   await run("chooses a pinned fallback account before other eligible accounts", async () => {
