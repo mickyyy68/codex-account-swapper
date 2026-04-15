@@ -602,6 +602,24 @@ async function main() {
     assert.equal(outputC, "\nassistant output");
   });
 
+  await run("highlights user prompt lines even when ansi redraw codes precede the prompt", async () => {
+    const transformer = createUserPromptOutputTransformer();
+    const output = transformer.transform("\u001b[2K\rÃ¢â‚¬Âº leggi il progetto");
+
+    assert.match(output, /\u001b\[48;5;236m/);
+    assert.match(output, /leggi il progetto/);
+  });
+
+  await run("keeps prompt highlighting when a plain chunk is followed by ansi redraw and prompt", async () => {
+    const transformer = createUserPromptOutputTransformer();
+    const outputA = transformer.transform("⚠ warning without newline");
+    const outputB = transformer.transform("\u001b[1G\u001b[2KÃ¢â‚¬Âº leggi il progetto");
+
+    assert.equal(outputA, "⚠ warning without newline");
+    assert.match(outputB, /\u001b\[48;5;236m/);
+    assert.match(outputB, /leggi il progetto/);
+  });
+
   await run("builds a terminal reset sequence that disables sticky tty modes", async () => {
     const sequence = buildTerminalResetSequence();
     assert.match(sequence, /\u001bc/);
