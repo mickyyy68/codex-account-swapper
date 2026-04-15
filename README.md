@@ -9,6 +9,7 @@ cdx
 ```
 
 `cdx` opens an interactive menu for:
+- Smart switch
 - Use account
 - Switch account
 - Save current auth as account
@@ -33,6 +34,47 @@ bun add -g codex-account-switcher
 Commands installed:
 - `cdx`
 - `cxs` (alias of `cdx`)
+- `ccx` (smart Codex wrapper)
+
+## Smart Switching
+
+`cdx` can now evaluate live account limits and switch to the best account automatically.
+
+Interactive:
+
+```bash
+cdx
+```
+
+then choose `Smart switch`.
+
+Non-interactive JSON output:
+
+```bash
+cdx smart-switch --json
+```
+
+## ccx
+
+`ccx` is a lightweight wrapper around the real `codex` CLI.
+
+Run:
+
+```bash
+ccx
+```
+
+Current behavior:
+- launches the real `codex` using your normal `~/.codex`
+- keeps Codex config, skills, sessions, and MCP setup intact
+- on `Enter`, checks the latest session rate limits before forwarding the prompt
+- if the active account is exhausted, runs `cdx smart-switch --json`
+- reopens the conversation with `codex fork <sessionId>`
+- restores the pending prompt in the reopened conversation without sending it automatically
+
+Current limitations:
+- it is optimized for normal interactive use, not scripted `codex` prompts passed on the CLI
+- it does not auto-submit the restored prompt
 
 ## Before Setup
 
@@ -60,5 +102,6 @@ It writes a marker file when migration is finalized (for example after import, o
 ## Notes
 
 - Interactive terminal required (TTY). Non-interactive runs exit with an error.
+- `cdx smart-switch --json` is the only supported non-interactive subcommand.
 - Legacy subcommands (`cdx use ...`, `cdx save ...`, etc.) are removed.
 - If an email can be detected from an account's auth file, `cdx` shows it in labels (for example, `work <name@company.com>`).

@@ -611,6 +611,215 @@ await run("prefers healthier credit balance over pinned low-credit accounts", as
   });
 });
 
+await run("runs smart switch operation and returns a machine-readable result", async () => {
+  const cdxDir = mkTempDir("cdx-test-smart-switch-operation-");
+  const codexHome = mkTempDir("cdx-test-smart-switch-operation-home-");
+  const authDir = path.join(cdxDir, "auth");
+  const accountsFile = path.join(cdxDir, "accounts.json");
+  const activeFile = path.join(cdxDir, "active");
+
+  fs.mkdirSync(authDir, { recursive: true });
+  const lowAuth = path.join(authDir, "low.auth.json");
+  const bestAuth = path.join(authDir, "best.auth.json");
+  writeAuthSnapshot(lowAuth, "acct-low", "low@example.com", "plus");
+  writeAuthSnapshot(bestAuth, "acct-best", "best@example.com", "plus");
+  fs.writeFileSync(
+    accountsFile,
+    JSON.stringify(
+      [
+        { name: "low", path: lowAuth },
+        { name: "best", path: bestAuth },
+      ],
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  fs.writeFileSync(activeFile, "low\n", "utf8");
+
+  await withEnv({ CDX_DIR: cdxDir, CODEX_HOME: codexHome }, async (internal) => {
+    internal.setLiveRateLimitFetcherForTests(async (accountPath) => {
+      if (accountPath === lowAuth) {
+        return {
+          available: true,
+          email: "low@example.com",
+          planType: "plus",
+          primary: { label: "5h", remainingPercent: 15, resetAt: "18:40", resetAtSeconds: 10 },
+          secondary: { label: "weekly", remainingPercent: 35, resetAt: "2039-09-18 18:40", resetAtSeconds: 100 },
+          credits: internal.createCreditsSummary({ hasCredits: true, balance: "2" }),
+          errorCode: "",
+        };
+      }
+      return {
+        available: true,
+        email: "best@example.com",
+        planType: "plus",
+        primary: { label: "5h", remainingPercent: 80, resetAt: "18:40", resetAtSeconds: 20 },
+        secondary: { label: "weekly", remainingPercent: 70, resetAt: "2039-09-18 18:40", resetAtSeconds: 200 },
+        credits: null,
+        errorCode: "",
+      };
+    });
+
+    const result = await internal.runSmartSwitchOperation();
+    assert.deepEqual(
+      result,
+      {
+        ok: true,
+        switched: true,
+        alreadyOptimal: false,
+        allExhausted: false,
+        from: "low",
+        to: "best",
+        reason: "best_available",
+        activeStatus: {
+          available: true,
+          email: "low@example.com",
+          planType: "plus",
+          primary: { label: "5h", remainingPercent: 15, resetAt: "18:40", resetAtSeconds: 10 },
+          secondary: { label: "weekly", remainingPercent: 35, resetAt: "2039-09-18 18:40", resetAtSeconds: 100 },
+          lowCredits: true,
+          zeroCredits: false,
+          credits: { hasCredits: true, unlimited: false, balance: "2" },
+          errorCode: "",
+        },
+        recommendedStatus: {
+          available: true,
+          email: "best@example.com",
+          planType: "plus",
+          primary: { label: "5h", remainingPercent: 80, resetAt: "18:40", resetAtSeconds: 20 },
+          secondary: { label: "weekly", remainingPercent: 70, resetAt: "2039-09-18 18:40", resetAtSeconds: 200 },
+          lowCredits: false,
+          zeroCredits: false,
+          credits: null,
+          errorCode: "",
+        },
+      },
+    );
+    assert.equal(fs.readFileSync(activeFile, "utf8").trim(), "best");
+  });
+});
+
+await run("reports all exhausted from smart switch operation", async () => {
+  const cdxDir = mkTempDir("cdx-test-smart-switch-all-exhausted-");
+  const codexHome = mkTempDir("cdx-test-smart-switch-all-exhausted-home-");
+  const authDir = path.join(cdxDir, "auth");
+  const accountsFile = path.join(cdxDir, "accounts.json");
+
+  fs.mkdirSync(authDir, { recursive: true });
+  const zeroAuth = path.join(authDir, "zero.auth.json");
+  writeAuthSnapshot(zeroAuth, "acct-zero", "zero@example.com", "plus");
+  fs.writeFileSync(
+    accountsFile,
+    JSON.stringify([{ name: "zero", path: zeroAuth }], null, 2),
+    "utf8",
+  );
+
+  await withEnv({ CDX_DIR: cdxDir, CODEX_HOME: codexHome }, async (internal) => {
+    internal.setLiveRateLimitFetcherForTests(async () => ({
+      available: true,
+      email: "zero@example.com",
+      planType: "plus",
+      primary: { label: "5h", remainingPercent: 0, resetAt: "18:40", resetAtSeconds: 10 },
+      secondary: { label: "weekly", remainingPercent: 20, resetAt: "2039-09-18 18:40", resetAtSeconds: 100 },
+      credits: null,
+      errorCode: "",
+    }));
+
+    const result = await internal.runSmartSwitchOperation();
+    assert.equal(result.ok, false);
+    assert.equal(result.allExhausted, true);
+    assert.equal(result.reason, "all_exhausted");
+    assert.equal(result.to, "");
+  });
+});
+
+await run("smart switch can bypass stale live-limit cache when forced", async () => {
+  const cdxDir = mkTempDir("cdx-test-smart-switch-force-refresh-");
+  const codexHome = mkTempDir("cdx-test-smart-switch-force-refresh-home-");
+  const authDir = path.join(cdxDir, "auth");
+  const accountsFile = path.join(cdxDir, "accounts.json");
+  const activeFile = path.join(cdxDir, "active");
+
+  fs.mkdirSync(authDir, { recursive: true });
+  const activeAuth = path.join(authDir, "active.auth.json");
+  const spareAuth = path.join(authDir, "spare.auth.json");
+  writeAuthSnapshot(activeAuth, "acct-active", "active@example.com", "plus");
+  writeAuthSnapshot(spareAuth, "acct-spare", "spare@example.com", "plus");
+  fs.writeFileSync(
+    accountsFile,
+    JSON.stringify(
+      [
+        { name: "active", path: activeAuth },
+        { name: "spare", path: spareAuth },
+      ],
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  fs.writeFileSync(activeFile, "active\n", "utf8");
+
+  await withEnv({ CDX_DIR: cdxDir, CODEX_HOME: codexHome }, async (internal) => {
+    let phase = "warm";
+    internal.setLiveRateLimitFetcherForTests(async (accountPath) => {
+      if (phase === "warm") {
+        return accountPath === activeAuth
+          ? {
+              available: true,
+              email: "active@example.com",
+              planType: "plus",
+              primary: { label: "5h", remainingPercent: 90, resetAt: "18:40", resetAtSeconds: 10 },
+              secondary: { label: "weekly", remainingPercent: 90, resetAt: "2039-09-18 18:40", resetAtSeconds: 100 },
+              credits: null,
+              errorCode: "",
+            }
+          : {
+              available: true,
+              email: "spare@example.com",
+              planType: "plus",
+              primary: { label: "5h", remainingPercent: 70, resetAt: "18:40", resetAtSeconds: 20 },
+              secondary: { label: "weekly", remainingPercent: 70, resetAt: "2039-09-18 18:40", resetAtSeconds: 200 },
+              credits: null,
+              errorCode: "",
+            };
+      }
+
+      return accountPath === activeAuth
+        ? {
+            available: true,
+            email: "active@example.com",
+            planType: "plus",
+            primary: { label: "5h", remainingPercent: 0, resetAt: "18:40", resetAtSeconds: 10 },
+            secondary: { label: "weekly", remainingPercent: 20, resetAt: "2039-09-18 18:40", resetAtSeconds: 100 },
+            credits: null,
+            errorCode: "",
+          }
+        : {
+            available: true,
+            email: "spare@example.com",
+            planType: "plus",
+            primary: { label: "5h", remainingPercent: 80, resetAt: "18:40", resetAtSeconds: 20 },
+            secondary: { label: "weekly", remainingPercent: 80, resetAt: "2039-09-18 18:40", resetAtSeconds: 200 },
+            credits: null,
+            errorCode: "",
+          };
+    });
+
+    const accounts = internal.readAccounts();
+    const warmOptions = await internal.buildSwitchAccountOptions(accounts, "active", "");
+    assert.equal(stripAnsi(warmOptions[0].label), "active <active@example.com> [PLUS] [RECOMMENDED] [ACTIVE]");
+
+    phase = "live";
+    const result = await internal.runSmartSwitchOperation({ forceRefreshLiveLimits: true });
+    assert.equal(result.ok, true);
+    assert.equal(result.switched, true);
+    assert.equal(result.from, "active");
+    assert.equal(result.to, "spare");
+    assert.equal(fs.readFileSync(activeFile, "utf8").trim(), "spare");
+  });
+});
+
 await run("prefers pinned healthy accounts and ignores excluded ones in recommendation", async () => {
   const cdxDir = mkTempDir("cdx-test-pinned-recommend-");
   const codexHome = mkTempDir("cdx-test-pinned-recommend-home-");

@@ -1366,13 +1366,14 @@ async function fetchLiveRateLimitStatus(accountPath) {
   }
 }
 
-async function getLiveRateLimitStatus(accountPath) {
+async function getLiveRateLimitStatus(accountPath, options = {}) {
   if (!isRegularFile(accountPath)) {
     return createUnavailableRateLimitStatus(getAccountMetadata(accountPath), "missing_auth");
   }
 
   const cacheKey = getLiveRateLimitCacheKey(accountPath);
-  const cached = LIVE_RATE_LIMIT_CACHE.get(cacheKey);
+  const forceRefresh = !!(options && options.forceRefresh);
+  const cached = forceRefresh ? null : LIVE_RATE_LIMIT_CACHE.get(cacheKey);
   const now = Date.now();
   if (cached && now - cached.fetchedAt < LIVE_RATE_LIMIT_TTL_MS) {
     return cached.status;
@@ -1736,9 +1737,9 @@ async function mapWithConcurrency(items, concurrency, worker) {
   return results;
 }
 
-async function loadSwitchAccountEntries(accounts) {
+async function loadSwitchAccountEntries(accounts, options = {}) {
   return mapWithConcurrency(accounts, LIVE_RATE_LIMIT_CONCURRENCY, async (account) => {
-    const status = await getLiveRateLimitStatus(account.path);
+    const status = await getLiveRateLimitStatus(account.path, options);
     return { account, status };
   });
 }
@@ -1759,9 +1760,139 @@ function buildSwitchAccountSelection(entries, activeName, disabledName) {
   };
 }
 
-async function buildSwitchAccountOptions(accounts, activeName, disabledName) {
-  const entries = await loadSwitchAccountEntries(accounts);
+function createRateLimitWindowSnapshot(summary) {
+  if (!summary) {
+    return null;
+  }
+
+  return {
+    label: summary.label,
+    remainingPercent: summary.remainingPercent,
+    resetAt: summary.resetAt,
+    resetAtSeconds: summary.resetAtSeconds,
+  };
+}
+
+function createStatusSnapshot(status) {
+  if (!status) {
+    return null;
+  }
+
+  return {
+    available: status.available === true,
+    email: status.email || "",
+    planType: status.planType || "",
+    primary: createRateLimitWindowSnapshot(status.primary),
+    secondary: createRateLimitWindowSnapshot(status.secondary),
+    lowCredits: statusHasLowCredits(status),
+    zeroCredits: statusHasZeroCredits(status),
+    credits: (() => {
+      const credits = getStatusCredits(status);
+      if (!credits) {
+        return null;
+      }
+      return {
+        hasCredits: credits.hasCredits === true,
+        unlimited: credits.unlimited === true,
+        balance: credits.balance || "",
+      };
+    })(),
+    errorCode: status.errorCode || "",
+  };
+}
+
+function getSmartSwitchDecisionFromSelection(selection, activeName) {
+  const entries = selection && selection.entriesByName
+    ? Array.from(selection.entriesByName.values())
+    : [];
+  const recommendedValue = selection && typeof selection.recommendedValue === "string"
+    ? selection.recommendedValue
+    : "";
+  const activeEntry = entries.find((entry) => entry.account.name === activeName) || null;
+  const recommendedEntry = recommendedValue
+    ? (selection.entriesByName.get(recommendedValue) || null)
+    : null;
+
+  if (!recommendedEntry) {
+    const allExhausted = areAllEligibleAccountsExhausted(entries);
+    return {
+      ok: false,
+      switched: false,
+      alreadyOptimal: false,
+      allExhausted,
+      from: activeName || "",
+      to: "",
+      reason: entries.length === 0 ? "no_accounts" : (allExhausted ? "all_exhausted" : "no_recommendation"),
+      activeStatus: createStatusSnapshot(activeEntry ? activeEntry.status : null),
+      recommendedStatus: null,
+    };
+  }
+
+  const lowCredits = statusHasLowCredits(recommendedEntry.status);
+  if (recommendedValue === activeName) {
+    return {
+      ok: true,
+      switched: false,
+      alreadyOptimal: true,
+      allExhausted: false,
+      from: activeName || "",
+      to: recommendedValue,
+      reason: lowCredits ? "already_optimal_low_credits" : "already_optimal",
+      activeStatus: createStatusSnapshot(recommendedEntry.status),
+      recommendedStatus: createStatusSnapshot(recommendedEntry.status),
+    };
+  }
+
+  return {
+    ok: true,
+    switched: false,
+    alreadyOptimal: false,
+    allExhausted: false,
+    from: activeName || "",
+    to: recommendedValue,
+    reason: lowCredits ? "best_available_low_credits" : "best_available",
+    activeStatus: createStatusSnapshot(activeEntry ? activeEntry.status : null),
+    recommendedStatus: createStatusSnapshot(recommendedEntry.status),
+  };
+}
+
+async function buildSwitchAccountOptions(accounts, activeName, disabledName, options = {}) {
+  const entries = await loadSwitchAccountEntries(accounts, options);
   return buildSwitchAccountSelection(entries, activeName, disabledName).options;
+}
+
+async function runSmartSwitchOperation(options = {}) {
+  const accounts = readAccounts();
+  const activeName = getActive();
+
+  if (accounts.length === 0) {
+    return {
+      ok: false,
+      switched: false,
+      alreadyOptimal: false,
+      allExhausted: false,
+      from: activeName || "",
+      to: "",
+      reason: "no_accounts",
+      activeStatus: null,
+      recommendedStatus: null,
+    };
+  }
+
+  const entries = await loadSwitchAccountEntries(accounts, {
+    forceRefresh: !!(options && options.forceRefreshLiveLimits),
+  });
+  const selection = buildSwitchAccountSelection(entries, activeName, "");
+  const decision = getSmartSwitchDecisionFromSelection(selection, activeName);
+  if (!decision.ok || decision.alreadyOptimal || !decision.to) {
+    return decision;
+  }
+
+  opUse(decision.to);
+  return {
+    ...decision,
+    switched: true,
+  };
 }
 
 function displayAccountList(p) {
@@ -2011,8 +2142,9 @@ async function runInteractive(migration) {
 
       const activeName = getActive();
       const selection = await loadSwitchAccountSelection(p, accounts, activeName, "");
-      if (!selection.recommendedValue) {
-        if (areAllEligibleAccountsExhausted(Array.from(selection.entriesByName.values()))) {
+      const decision = getSmartSwitchDecisionFromSelection(selection, activeName);
+      if (!decision.ok) {
+        if (decision.allExhausted) {
           p.log.error("All eligible accounts are exhausted right now.");
         } else {
           p.log.warn("No smart-switch account is available.");
@@ -2020,16 +2152,17 @@ async function runInteractive(migration) {
         continue;
       }
 
-      const entry = selection.entriesByName.get(selection.recommendedValue);
+      const targetName = decision.to || activeName;
+      const entry = targetName ? selection.entriesByName.get(targetName) : null;
       if (entry && statusNeedsHardWarning(entry.status)) {
-        const confirmed = await confirmDepletedSelection(p, selection.recommendedValue, entry.status);
+        const confirmed = await confirmDepletedSelection(p, targetName, entry.status);
         if (!confirmed) {
           p.log.info("Smart switch cancelled.");
           continue;
         }
       }
 
-      if (selection.recommendedValue === activeName) {
+      if (decision.alreadyOptimal) {
         const currentEntry = selection.entriesByName.get(activeName);
         const lowCreditsMessage = currentEntry && statusHasLowCredits(currentEntry.status)
           ? ` (low credits: ${getCreditBalanceLabel(currentEntry.status)})`
@@ -2040,10 +2173,10 @@ async function runInteractive(migration) {
 
       if (entry && statusHasLowCredits(entry.status)) {
         p.log.warn(
-          `Smart switch picked '${selection.recommendedValue}' with low credits (${getCreditBalanceLabel(entry.status)}).`,
+          `Smart switch picked '${targetName}' with low credits (${getCreditBalanceLabel(entry.status)}).`,
         );
       }
-      p.outro(opUse(selection.recommendedValue));
+      p.outro(opUse(targetName));
       return;
     }
 
@@ -2193,8 +2326,39 @@ async function runInteractive(migration) {
 
 async function main() {
   const args = process.argv.slice(2);
+  const isSmartSwitchCommand = args[0] === "smart-switch";
+  const jsonOutput = args.includes("--json");
+
+  if (isSmartSwitchCommand) {
+    const unsupportedArgs = args.slice(1).filter((arg) => arg !== "--json");
+    if (unsupportedArgs.length > 0) {
+      die("usage: cdx smart-switch [--json]");
+    }
+
+    ensureState();
+    try {
+      const result = await runSmartSwitchOperation();
+      if (jsonOutput) {
+        process.stdout.write(`${JSON.stringify(result)}\n`);
+      } else if (result.ok && result.switched) {
+        process.stdout.write(`Switched '${result.from}' -> '${result.to}'\n`);
+      } else if (result.ok && result.alreadyOptimal) {
+        process.stdout.write(`Already using smart account '${result.to}'\n`);
+      } else if (result.reason === "all_exhausted") {
+        process.stdout.write("All eligible accounts are exhausted right now.\n");
+      } else if (result.reason === "no_accounts") {
+        process.stdout.write("No accounts configured.\n");
+      } else {
+        process.stdout.write("No smart-switch account is available.\n");
+      }
+      process.exit(result.ok ? 0 : (result.allExhausted ? 2 : 1));
+    } catch (err) {
+      die(err.message || String(err));
+    }
+  }
+
   if (args.length > 0) {
-    die("subcommands were removed. Run `cdx` with no arguments.");
+    die("subcommands were removed. Run `cdx` with no arguments, or use `cdx smart-switch --json`.");
   }
 
   requireTTY();
@@ -2220,6 +2384,7 @@ module.exports = {
     normalizeAccountEntry,
     readAccountsFromJson,
     readAccounts,
+    getActive,
     repairAccountsState,
     repairAccountsStateOnDisk,
     formatRepairSummary,
@@ -2255,6 +2420,10 @@ module.exports = {
     hasFreshLiveRateLimitCache,
     getRecommendedSwitchAccount,
     buildSwitchAccountSelection,
+    getSmartSwitchDecisionFromSelection,
+    createStatusSnapshot,
+    runSmartSwitchOperation,
+    opUse,
     formatRateLimitHint,
     buildSwitchAccountLabel,
     buildSwitchAccountHint,
