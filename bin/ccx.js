@@ -154,6 +154,7 @@ async function discoverSessionFile(cwd, startedAtMs, launchNonceRef, excludedFil
 function createSupervisor() {
   return {
     ptyProcess: null,
+    outputTransformer: null,
     draftBuffer: "",
     lastSubmittedPrompt: "",
     outputBuffer: "",
@@ -330,6 +331,7 @@ async function main() {
 
     state.ptyProcess = child;
     const outputTransformer = createUserPromptOutputTransformer();
+    state.outputTransformer = outputTransformer;
     const prefillController = createPrefillController({
       prefillText,
       autoSubmit: autoSubmitPrefill,
@@ -384,6 +386,9 @@ async function main() {
       const flushedOutput = outputTransformer.flush();
       if (flushedOutput) {
         process.stdout.write(flushedOutput);
+      }
+      if (state.outputTransformer === outputTransformer) {
+        state.outputTransformer = null;
       }
       state.ptyProcess = null;
       if (wasSwitching || state.shuttingDown) {
@@ -603,6 +608,10 @@ async function main() {
     });
     const inputState = applyInputChunk(state.draftBuffer, text);
     state.draftBuffer = escapeRequested ? "" : inputState.draft;
+    if (escapeRequested && state.outputTransformer && typeof state.outputTransformer.reset === "function") {
+      state.outputTransformer.reset();
+      state.outputBuffer = "";
+    }
 
     if (inputState.submitted) {
       const pendingPrompt = resolvePendingPrompt(state.draftBuffer, state.outputBuffer);

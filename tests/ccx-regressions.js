@@ -657,6 +657,16 @@ async function main() {
     assert.match(outputB, /leggi il progetto/);
   });
 
+  await run("resets prompt-highlighting state after escape-like redraw interruptions", async () => {
+    const transformer = createUserPromptOutputTransformer();
+    const outputA = transformer.transform("\u203a leggi");
+    transformer.reset();
+    const outputB = transformer.transform("\u203a il progetto\n");
+
+    assert.match(outputA, /\u001b\[48;5;236m/);
+    assert.match(outputB, /\u001b\[48;5;236m› il progetto\u001b\[49m/);
+  });
+
   await run("builds a terminal reset sequence that disables sticky tty modes", async () => {
     const sequence = buildTerminalResetSequence();
     assert.match(sequence, /\u001bc/);
@@ -788,6 +798,7 @@ async function main() {
     const banner = formatStartupBanner();
     assert.match(banner, /CCX/);
     assert.match(banner, /____/);
+    assert.doesNotMatch(banner, /\\u001b\[0m/);
   });
 
   await run("highlights user prompt lines with the real prompt symbol", async () => {
