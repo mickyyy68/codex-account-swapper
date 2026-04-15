@@ -17,7 +17,9 @@ const cdxInternal = require("./cdx.js")._internal;
 const {
   listSessionFilesRecursive,
   findMatchingSessionFile,
+  findSessionFileById,
   readLatestSessionStateFromSessionFile,
+  readLatestSessionStateFromSessionFileAfterSize,
   readLatestUserMessageFromSessionFile,
   isSessionStateUsageLimitExceeded,
 } = require("../lib/ccx/session-log");
@@ -162,6 +164,7 @@ function createSupervisor() {
     switching: false,
     sessionId: "",
     sessionFilePath: "",
+    sessionStateBaselineSize: 0,
     launchNonce: 0,
     usageLimitWatchNonce: 0,
     shuttingDown: false,
@@ -221,6 +224,12 @@ async function main() {
       return null;
     }
     try {
+      if (state.sessionStateBaselineSize > 0) {
+        return readLatestSessionStateFromSessionFileAfterSize(
+          state.sessionFilePath,
+          state.sessionStateBaselineSize,
+        );
+      }
       return readLatestSessionStateFromSessionFile(state.sessionFilePath);
     } catch (_) {
       return null;
@@ -249,6 +258,18 @@ async function main() {
     }
     state.sessionId = resumeSessionId;
     writeDebugLog("session_id_from_output", { sessionId: resumeSessionId });
+  }
+
+  function captureSessionStateBaseline() {
+    if (!state.sessionFilePath) {
+      state.sessionStateBaselineSize = 0;
+      return;
+    }
+    try {
+      state.sessionStateBaselineSize = fs.statSync(state.sessionFilePath).size;
+    } catch (_) {
+      state.sessionStateBaselineSize = 0;
+    }
   }
 
   function armUsageLimitWatch(pendingPrompt) {
@@ -310,6 +331,7 @@ async function main() {
     const currentLaunchNonce = state.launchNonce;
     state.sessionId = "";
     state.sessionFilePath = "";
+    state.sessionStateBaselineSize = 0;
     state.outputBuffer = "";
     cancelUsageLimitWatch();
     const prefillText = typeof options.prefillText === "string" ? options.prefillText : "";
@@ -420,6 +442,16 @@ async function main() {
     }
 
     const launchToken = { cancelled: false };
+    if (Array.isArray(args) && args[0] === "resume" && typeof args[1] === "string" && args[1]) {
+      const resumedSession = findSessionFileById({
+        sessionsDir: SESSIONS_DIR,
+        sessionId: args[1],
+      });
+      if (resumedSession) {
+        state.sessionId = resumedSession.id;
+        state.sessionFilePath = resumedSession.filePath;
+      }
+    }
     discoverSessionFile(process.cwd(), startedAtMs, launchToken, existingSessionFiles)
       .then((match) => {
         if (!match || currentLaunchNonce !== state.launchNonce) {
@@ -570,6 +602,7 @@ async function main() {
         state.lastSubmittedPrompt = submittedPrompt;
         state.draftBuffer = "";
         state.outputBuffer = "";
+        captureSessionStateBaseline();
         writeStatusLine(formatHighlightedUserPrompt(submittedPrompt));
         armUsageLimitWatch(submittedPrompt);
       },
@@ -581,6 +614,8 @@ async function main() {
     if (state.ptyProcess) {
       state.lastSubmittedPrompt = pendingPrompt;
       state.draftBuffer = "";
+      state.outputBuffer = "";
+      captureSessionStateBaseline();
       writeStatusLine(formatHighlightedUserPrompt(pendingPrompt));
       for (const chunk of getForwardingChunks(text)) {
         state.ptyProcess.write(chunk);

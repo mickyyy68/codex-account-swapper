@@ -12,8 +12,10 @@ const {
   parseSessionErrorLine,
   readSessionMeta,
   findMatchingSessionFile,
+  findSessionFileById,
   readLatestRateLimitsFromSessionFile,
   readLatestSessionStateFromSessionFile,
+  readLatestSessionStateFromSessionFileAfterSize,
   readLatestUserMessageFromSessionFile,
   isRateLimitsExhausted,
   isSessionStateUsageLimitExceeded,
@@ -200,6 +202,31 @@ async function main() {
     assert.equal(match.filePath, newFile);
   });
 
+  await run("finds an existing session file by session id for resume flows", async () => {
+    const sessionsRoot = mkTempDir("ccx-test-session-by-id-");
+    const targetFile = path.join(sessionsRoot, "2026", "04", "15", "resume-target.jsonl");
+    const otherFile = path.join(sessionsRoot, "2026", "04", "15", "other.jsonl");
+
+    writeSessionFile(otherFile, {
+      id: "sess-other",
+      timestamp: "2026-04-15T12:00:00.000Z",
+      cwd: "C:\\repo",
+    });
+    writeSessionFile(targetFile, {
+      id: "sess-resume",
+      timestamp: "2026-04-15T12:05:00.000Z",
+      cwd: "C:\\repo",
+    });
+
+    const match = findSessionFileById({
+      sessionsDir: sessionsRoot,
+      sessionId: "sess-resume",
+    });
+
+    assert.equal(match.id, "sess-resume");
+    assert.equal(match.filePath, targetFile);
+  });
+
   await run("ignores known pre-launch session files when matching the current session", async () => {
     const sessionsRoot = mkTempDir("ccx-test-session-snapshot-");
     const targetCwd = "C:\\Users\\filmd\\Documents\\codex-account-switcher";
@@ -337,6 +364,52 @@ async function main() {
     assert.equal(sessionState.rateLimits.limitId, "premium");
     assert.equal(sessionState.latestError.code, "usage_limit_exceeded");
     assert.equal(isSessionStateUsageLimitExceeded(sessionState), true);
+  });
+
+  await run("ignores stale session errors that happened before the current submit", async () => {
+    const sessionsRoot = mkTempDir("ccx-test-session-baseline-");
+    const sessionFile = path.join(sessionsRoot, "2026", "04", "15", "rollout.jsonl");
+
+    writeSessionFile(
+      sessionFile,
+      {
+        id: "sess-baseline",
+        timestamp: "2026-04-15T16:13:57.632Z",
+        cwd: "C:\\repo",
+      },
+      [
+        JSON.stringify({
+          timestamp: "2026-04-15T16:14:02.232Z",
+          type: "event_msg",
+          payload: {
+            type: "error",
+            message: "You've hit your usage limit. Try again later.",
+            codex_error_info: "usage_limit_exceeded",
+          },
+        }),
+      ],
+    );
+
+    const baselineSize = fs.statSync(sessionFile).size;
+    const staleState = readLatestSessionStateFromSessionFileAfterSize(sessionFile, baselineSize);
+    assert.equal(staleState, null);
+
+    fs.appendFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        timestamp: "2026-04-15T16:15:02.232Z",
+        type: "event_msg",
+        payload: {
+          type: "error",
+          message: "You've hit your usage limit. Try again later.",
+          codex_error_info: "usage_limit_exceeded",
+        },
+      })}\n`,
+      "utf8",
+    );
+
+    const newState = readLatestSessionStateFromSessionFileAfterSize(sessionFile, baselineSize);
+    assert.equal(newState.latestError.code, "usage_limit_exceeded");
   });
 
   await run("reads the latest submitted user prompt from a session file", async () => {
