@@ -34,6 +34,7 @@ const {
 const {
   applyInputChunk,
   chunkRequestsAbort,
+  chunkRequestsEscape,
   getForwardingOverride,
   hasDraftText,
 } = require("../lib/ccx/input-buffer");
@@ -56,6 +57,9 @@ const {
   ANSI_RESET_BACKGROUND,
   formatHighlightedUserPrompt,
 } = require("../lib/ccx/output-style");
+const {
+  formatStartupBanner,
+} = require("../lib/ccx/startup-ui");
 
 function mkTempDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -531,6 +535,15 @@ async function main() {
     assert.equal(chunkRequestsAbort("leggi il progetto"), false);
   });
 
+  await run("detects escape as a local draft-reset control without treating it as abort", async () => {
+    assert.equal(
+      chunkRequestsEscape("\u001b[27;1;0;1;0;1_\u001b[27;1;0;0;0;1_"),
+      true,
+    );
+    assert.equal(chunkRequestsAbort("\u001b[27;1;0;1;0;1_\u001b[27;1;0;0;0;1_"), false);
+    assert.equal(chunkRequestsEscape("leggi il progetto"), false);
+  });
+
   await run("forwards win32 escape as a plain ESC character", async () => {
     assert.equal(
       getForwardingOverride("\u001b[27;1;0;1;0;1_\u001b[27;1;0;0;0;1_"),
@@ -750,6 +763,41 @@ async function main() {
       true,
     );
     assert.deepEqual(writes, ["leggi il progetto"]);
+  });
+
+  await run("extracts the latest visible prompt text with the real prompt symbol", async () => {
+    const prompt = extractVisiblePromptDraft(
+      [
+        "something earlier",
+        "\u203a vecchio prompt",
+        "",
+        "\u25a0 You've hit your usage limit.",
+        "\u203a leggi il progetto",
+      ].join("\n"),
+    );
+
+    assert.equal(prompt, "leggi il progetto");
+  });
+
+  await run("falls back to visible prompt text with the real prompt symbol", async () => {
+    const pendingPrompt = resolvePendingPrompt("", "header\n\u203a leggi il progetto\n");
+    assert.equal(pendingPrompt, "leggi il progetto");
+  });
+
+  await run("formats a startup banner with a large CCX header", async () => {
+    const banner = formatStartupBanner();
+    assert.match(banner, /CCX/);
+    assert.match(banner, /____/);
+  });
+
+  await run("highlights user prompt lines with the real prompt symbol", async () => {
+    const output = highlightUserPromptLines("header\n\u203a leggi il progetto\nassistant output");
+    assert.match(output, /\u001b\[48;5;236m› leggi il progetto\u001b\[49m/);
+  });
+
+  await run("formats an explicitly highlighted user prompt line with the real prompt symbol", async () => {
+    const output = formatHighlightedUserPrompt("leggi il progetto");
+    assert.match(output, /\u001b\[48;5;236m› leggi il progetto\u001b\[49m/);
   });
 
   process.stdout.write("all ccx regression tests passed\n");

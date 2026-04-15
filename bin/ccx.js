@@ -39,6 +39,7 @@ const {
 const {
   applyInputChunk,
   chunkRequestsAbort,
+  chunkRequestsEscape,
   getForwardingOverride,
   hasDraftText,
 } = require("../lib/ccx/input-buffer");
@@ -58,6 +59,9 @@ const {
 const {
   restoreTerminalState,
 } = require("../lib/ccx/terminal-state");
+const {
+  formatStartupBanner,
+} = require("../lib/ccx/startup-ui");
 
 const CODEX_HOME_DIR = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const SESSIONS_DIR = path.join(CODEX_HOME_DIR, "sessions");
@@ -164,6 +168,7 @@ function createSupervisor() {
 
 async function main() {
   requireTTY();
+  writeStatusLine(formatStartupBanner());
 
   const forwardedArgs = process.argv.slice(2);
   const state = createSupervisor();
@@ -578,6 +583,7 @@ async function main() {
   async function onInput(data) {
     const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
     const forwardingOverride = getForwardingOverride(text);
+    const escapeRequested = chunkRequestsEscape(text);
     if (chunkRequestsAbort(text)) {
       writeDebugLog("interrupt_exit", {
         switching: state.switching,
@@ -596,7 +602,7 @@ async function main() {
       raw: JSON.stringify(text),
     });
     const inputState = applyInputChunk(state.draftBuffer, text);
-    state.draftBuffer = inputState.draft;
+    state.draftBuffer = escapeRequested ? "" : inputState.draft;
 
     if (inputState.submitted) {
       const pendingPrompt = resolvePendingPrompt(state.draftBuffer, state.outputBuffer);
