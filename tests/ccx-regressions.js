@@ -125,6 +125,16 @@ function writeSessionFile(filePath, meta, lines = []) {
 }
 
 async function main() {
+  await run("exports a shared cdx wrapper entrypoint", async () => {
+    const wrapper = require("../lib/cdx/wrapper");
+    assert.equal(typeof wrapper.runCodexWrapper, "function");
+  });
+
+  await run("keeps bin/ccx as a thin compatibility entrypoint", async () => {
+    const source = fs.readFileSync(path.resolve(__dirname, "..", "bin", "ccx.js"), "utf8");
+    assert.match(source, /runCodexWrapper/);
+  });
+
   await run("parses session meta lines", async () => {
     const parsed = parseSessionMetaLine(
       JSON.stringify({

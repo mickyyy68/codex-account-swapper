@@ -4,6 +4,7 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { runCodexWrapper } = require("../lib/cdx/wrapper");
 
 let pty;
 try {
@@ -176,7 +177,7 @@ function createSupervisor() {
   };
 }
 
-async function main() {
+async function main({ forwardedArgs }) {
   requireTTY();
   writeStatusLine(formatStartupBanner());
   const bootstrap = ensureCurrentAuthRegistered({
@@ -187,7 +188,6 @@ async function main() {
     writeStatusLine(`[ccx] ${bootstrap.message}`);
   }
 
-  const forwardedArgs = process.argv.slice(2);
   const state = createSupervisor();
 
   function cleanup() {
@@ -710,6 +710,10 @@ async function main() {
   await launchCodex(forwardedArgs);
 }
 
-main().catch((err) => {
-  die(err.message || String(err));
+runCodexWrapper({
+  argv: process.argv.slice(2),
+  mainImpl: main,
+}).catch((err) => {
+  process.stderr.write(`ccx: ${err.message || String(err)}\n`);
+  process.exit(1);
 });
