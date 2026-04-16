@@ -30,9 +30,25 @@ run("approval ui does not become a pending prompt", () => {
   assert.equal(prompt, "");
 });
 
-run("normal output chunks are not buffered waiting for newlines", () => {
+run("visible multiline prompt survives footer lines but not approval ui", () => {
+  assert.equal(
+    resolvePendingPrompt(
+      "",
+      [
+        "header",
+        "\u203a leggi il progetto",
+        "  su piu righe",
+        "  gpt-5.4 xhigh · ~\\Documents\\repo",
+      ].join("\n"),
+    ),
+    "leggi il progetto\n  su piu righe",
+  );
+});
+
+run("normal output chunks flush buffered leading whitespace", () => {
   const transformer = createUserPromptOutputTransformer();
-  assert.equal(transformer.transform("  hello there"), "  hello there");
+  assert.equal(transformer.transform("  hello there"), "");
+  assert.equal(transformer.flush(), "  hello there");
 });
 
 run("footer badge still appears for real codex footer lines", () => {
