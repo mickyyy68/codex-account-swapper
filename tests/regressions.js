@@ -1029,17 +1029,17 @@ await run("routes codex-style invocations to the wrapper lane", async () => {
 
   assert.deepEqual(
     decideCdxMode({ args: [], isTTY: true }),
-    { kind: "wrapper", forwardedArgs: [] },
+    { kind: "wrapper", forwardedArgs: [], isTTY: true },
   );
 
   assert.deepEqual(
     decideCdxMode({ args: ["resume", "--last"], isTTY: true }),
-    { kind: "wrapper", forwardedArgs: ["resume", "--last"] },
+    { kind: "wrapper", forwardedArgs: ["resume", "--last"], isTTY: true },
   );
 
   assert.deepEqual(
     decideCdxMode({ args: ["exec", "print('hi')"], isTTY: false }),
-    { kind: "wrapper", forwardedArgs: ["exec", "print('hi')"] },
+    { kind: "wrapper", forwardedArgs: ["exec", "print('hi')"], isTTY: false },
   );
 });
 
