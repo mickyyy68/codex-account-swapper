@@ -1010,6 +1010,18 @@ await run("builds switch account options from live limits and reuses cache", asy
   );
 });
 
+await run("exports a reusable manual entrypoint", async () => {
+  const manual = require("../lib/cdx/manual");
+  assert.equal(typeof manual.runManualEntryPoint, "function");
+});
+
+await run("keeps smart-switch internals available after manual extraction", async () => {
+  await withEnv({ CDX_DIR: mkTempDir("cdx-plan-manual-"), CODEX_HOME: mkTempDir("cdx-plan-home-") }, async (internal) => {
+    assert.equal(typeof internal.runSmartSwitchOperation, "function");
+    assert.equal(typeof internal.ensureState, "function");
+  });
+});
+
 await run("dispatches manual and smart-switch modes explicitly", async () => {
   const { decideCdxMode } = require("../lib/cdx/dispatcher");
 

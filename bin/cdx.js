@@ -6,6 +6,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
+const { runManualEntryPoint } = require("../lib/cdx/manual");
+
 const CDX_DIR = process.env.CDX_DIR || path.join(os.homedir(), ".cdx");
 const ACCOUNTS_FILE = path.join(CDX_DIR, "accounts.json");
 const LEGACY_ACCOUNTS_FILE = path.join(CDX_DIR, "accounts.tsv");
@@ -2431,19 +2433,14 @@ async function main() {
     die("subcommands were removed. Run `cdx` with no arguments, or use `cdx smart-switch --json`.");
   }
 
-  requireTTY();
-  const migration = ensureState();
-
-  try {
-    await runInteractive(migration);
-  } catch (err) {
-    if (err instanceof PromptCancelledError) {
-      const p = await loadPrompts();
-      p.cancel("Operation cancelled");
-      process.exit(1);
-    }
-    die(err.message || String(err));
-  }
+  await runManualEntryPoint({
+    ensureState,
+    requireTTY,
+    runInteractive,
+    PromptCancelledError,
+    loadPrompts,
+    die,
+  });
 }
 
 module.exports = {
