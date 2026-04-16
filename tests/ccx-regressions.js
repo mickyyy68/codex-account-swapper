@@ -4,6 +4,7 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { spawnSync } = require("node:child_process");
 const assert = require("node:assert/strict");
 
 const {
@@ -137,6 +138,50 @@ async function main() {
 
     assert.equal(typeof ccx._internalMain, "function");
     assert.match(source, /if \(require\.main === module\)/);
+  });
+
+  await run("delegates the bin/ccx CLI path through runCodexWrapper with argv and mainImpl", async () => {
+    const tempDir = mkTempDir("ccx-test-cli-seam-");
+    const preloadPath = path.join(tempDir, "preload.js");
+    const wrapperPath = path.resolve(__dirname, "..", "lib", "cdx", "wrapper.js");
+    const preloadSource = [
+      '"use strict";',
+      'const Module = require("node:module");',
+      `const wrapperPath = ${JSON.stringify(wrapperPath)};`,
+      `const ccxPath = ${JSON.stringify(CCX_BIN_PATH)};`,
+      'const stub = new Module(wrapperPath);',
+      'stub.filename = wrapperPath;',
+      'stub.loaded = true;',
+      'stub.exports = {',
+      '  runCodexWrapper: async (options) => {',
+      '    const ccx = require(ccxPath);',
+      '    process.stdout.write(`WRAPPER_SEAM ${JSON.stringify({',
+      '      argv: options.argv,',
+      '      sameMain: options.mainImpl === ccx._internalMain,',
+      '      mainType: typeof options.mainImpl,',
+      '    })}\\n`);',
+      '  },',
+      '};',
+      'require.cache[wrapperPath] = stub;',
+      '',
+    ].join("\n");
+
+    fs.writeFileSync(preloadPath, preloadSource, "utf8");
+
+    const result = spawnSync(process.execPath, [CCX_BIN_PATH, "resume", "--last"], {
+      cwd: path.resolve(__dirname, ".."),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        NODE_OPTIONS: `--require ${preloadPath}`,
+      },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /WRAPPER_SEAM/);
+    assert.match(result.stdout, /"argv":\["resume","--last"\]/);
+    assert.match(result.stdout, /"sameMain":true/);
+    assert.match(result.stdout, /"mainType":"function"/);
   });
 
   await run("runCodexWrapper forwards argv to mainImpl and returns its result", async () => {
