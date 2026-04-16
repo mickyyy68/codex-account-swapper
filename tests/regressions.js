@@ -1015,6 +1015,104 @@ await run("exports a reusable manual entrypoint", async () => {
   assert.equal(typeof manual.runManualEntryPoint, "function");
 });
 
+await run("manual entrypoint enforces TTY, initializes state, and runs interactive flow", async () => {
+  const { runManualEntryPoint } = require("../lib/cdx/manual");
+  const calls = [];
+  const migration = { migrated: true, count: 2 };
+  let interactiveArg = null;
+
+  await runManualEntryPoint({
+    requireTTY() {
+      calls.push("requireTTY");
+    },
+    ensureState() {
+      calls.push("ensureState");
+      return migration;
+    },
+    async runInteractive(value) {
+      calls.push("runInteractive");
+      interactiveArg = value;
+    },
+    PromptCancelledError: class PromptCancelledError extends Error {},
+    async loadPrompts() {
+      throw new Error("loadPrompts should not run during the success path");
+    },
+    die(message) {
+      throw new Error(`die should not be called: ${message}`);
+    },
+    exit(code) {
+      throw new Error(`exit should not be called: ${code}`);
+    },
+  });
+
+  assert.deepEqual(calls, ["requireTTY", "ensureState", "runInteractive"]);
+  assert.equal(interactiveArg, migration);
+});
+
+await run("manual entrypoint handles prompt cancellation through prompts and injected exit", async () => {
+  const { runManualEntryPoint } = require("../lib/cdx/manual");
+  class PromptCancelledError extends Error {}
+
+  let cancelMessage = "";
+  let exitCode = null;
+
+  await runManualEntryPoint({
+    requireTTY() {},
+    ensureState() {
+      return { migrated: false, count: 0 };
+    },
+    async runInteractive() {
+      throw new PromptCancelledError();
+    },
+    PromptCancelledError,
+    async loadPrompts() {
+      return {
+        cancel(message) {
+          cancelMessage = message;
+        },
+      };
+    },
+    die(message) {
+      throw new Error(`die should not be called: ${message}`);
+    },
+    exit(code) {
+      exitCode = code;
+    },
+  });
+
+  assert.equal(cancelMessage, "Operation cancelled");
+  assert.equal(exitCode, 1);
+});
+
+await run("manual entrypoint routes non-cancel errors through die", async () => {
+  const { runManualEntryPoint } = require("../lib/cdx/manual");
+  class PromptCancelledError extends Error {}
+
+  let dieMessage = "";
+
+  await runManualEntryPoint({
+    requireTTY() {},
+    ensureState() {
+      return { migrated: false, count: 0 };
+    },
+    async runInteractive() {
+      throw new Error("interactive failed");
+    },
+    PromptCancelledError,
+    async loadPrompts() {
+      throw new Error("loadPrompts should not run for non-cancel errors");
+    },
+    die(message) {
+      dieMessage = message;
+    },
+    exit(code) {
+      throw new Error(`exit should not be called: ${code}`);
+    },
+  });
+
+  assert.equal(dieMessage, "interactive failed");
+});
+
 await run("keeps smart-switch internals available after manual extraction", async () => {
   await withEnv({ CDX_DIR: mkTempDir("cdx-plan-manual-"), CODEX_HOME: mkTempDir("cdx-plan-home-") }, async (internal) => {
     assert.equal(typeof internal.runSmartSwitchOperation, "function");

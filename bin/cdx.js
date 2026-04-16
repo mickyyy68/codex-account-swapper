@@ -2440,6 +2440,7 @@ async function main() {
     PromptCancelledError,
     loadPrompts,
     die,
+    exit: (code) => process.exit(code),
   });
 }
 
