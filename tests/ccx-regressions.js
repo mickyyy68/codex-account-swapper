@@ -130,9 +130,33 @@ async function main() {
     assert.equal(typeof wrapper.runCodexWrapper, "function");
   });
 
+  await run("runCodexWrapper forwards argv to mainImpl and returns its result", async () => {
+    const { runCodexWrapper } = require("../lib/cdx/wrapper");
+    const argv = ["resume", "sess-123"];
+    const calls = [];
+    const expected = { ok: true, forwarded: true };
+
+    const result = await runCodexWrapper({
+      argv,
+      mainImpl: async (options) => {
+        calls.push(options);
+        return expected;
+      },
+    });
+
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0], { forwardedArgs: argv });
+    assert.equal(result, expected);
+  });
+
   await run("keeps bin/ccx as a thin compatibility entrypoint", async () => {
     const source = fs.readFileSync(path.resolve(__dirname, "..", "bin", "ccx.js"), "utf8");
     assert.match(source, /runCodexWrapper/);
+  });
+
+  await run("reuses die in the bin/ccx wrapper bootstrap error path", async () => {
+    const source = fs.readFileSync(path.resolve(__dirname, "..", "bin", "ccx.js"), "utf8");
+    assert.match(source, /runCodexWrapper\([\s\S]*?\.catch\(\(err\) => {\s*die\(/);
   });
 
   await run("parses session meta lines", async () => {

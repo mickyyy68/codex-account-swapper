@@ -714,6 +714,5 @@ runCodexWrapper({
   argv: process.argv.slice(2),
   mainImpl: main,
 }).catch((err) => {
-  process.stderr.write(`ccx: ${err.message || String(err)}\n`);
-  process.exit(1);
+  die(err.message || String(err));
 });
