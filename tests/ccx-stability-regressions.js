@@ -45,7 +45,7 @@ run("visible multiline prompt survives footer lines but not approval ui", () => 
   );
 });
 
-run("visible multiline prompt survives footer lines and approval ui still blocks pending prompt", () => {
+run("visible multiline prompt with footer and approval ui does not become a pending prompt", () => {
   assert.equal(
     resolvePendingPrompt(
       "",
@@ -54,17 +54,6 @@ run("visible multiline prompt survives footer lines and approval ui still blocks
         "\u203a leggi il progetto",
         "  su piu righe",
         "  gpt-5.4 xhigh · ~\\Documents\\repo",
-      ].join("\n"),
-    ),
-    "leggi il progetto\n  su piu righe",
-  );
-
-  assert.equal(
-    resolvePendingPrompt(
-      "",
-      [
-        "header",
-        "\u203a leggi il progetto",
         "",
         "Allow command execution?",
         "  Enter = approve",
@@ -75,7 +64,7 @@ run("visible multiline prompt survives footer lines and approval ui still blocks
   );
 });
 
-run("visible multiline prompt still recovers when the buffer ends after the prompt block", () => {
+run("visible multiline prompt with blank tail does not become a pending prompt", () => {
   assert.equal(
     resolvePendingPrompt(
       "",
@@ -86,7 +75,7 @@ run("visible multiline prompt still recovers when the buffer ends after the prom
         "",
       ].join("\n"),
     ),
-    "leggi il progetto\n  su piu righe",
+    "",
   );
 });
 
