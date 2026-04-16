@@ -1,4 +1,4 @@
-# CCX Transparent Wrapper Design
+# CDX Transparent Wrapper Design
 
 Date: 2026-04-16
 Status: Proposed
@@ -6,23 +6,25 @@ Author: Codex
 
 ## Goal
 
-Evolve `ccx` from a purpose-built smart-switch wrapper into a transparent compatibility shell for `codex`.
+Evolve `cdx` from an account-management entrypoint into the main transparent wrapper for `codex`, while moving the current account-management UI under `cdx manual`.
 
 User-facing contract:
 
-- Replace `codex` with `ccx`.
-- Keep the same CLI shape and the same command surface.
+- Replace `codex` with `cdx`.
+- Keep the same CLI shape and same command surface for wrapped Codex usage.
+- Make `cdx` with no arguments behave like a wrapped `codex` interactive session.
 - Preserve native Codex behavior by default.
-- Add smart account-switching behavior only when `ccx` can wrap an interactive session safely.
-- Refuse to start instead of launching a half-broken wrapper.
-- Make it visually clear that the user is inside `CCX`, using restrained green accents and `CCX` ASCII branding without breaking terminal coherence.
+- Add smart account-switching behavior only when `cdx` can wrap an interactive session safely.
+- Move the current account manager UI to `cdx manual`.
+- Refuse to start instead of launching a half-broken interactive wrapper.
 
-The design prioritizes forward compatibility. If Codex adds commands or flags later, `ccx` should usually inherit them automatically without needing command-specific support.
+The design prioritizes forward compatibility. If Codex adds commands or flags later, `cdx` should usually inherit them automatically without command-specific support.
 
 ## Non-Goals
 
-- Reimplement Codex commands or TUI behavior inside `ccx`.
+- Reimplement Codex commands or TUI behavior inside `cdx`.
 - Maintain feature-by-feature hardcoded support for every Codex subcommand.
+- Keep the current `cdx` menu as the default command entrypoint.
 - Depend on fragile TUI parsing as the primary source of truth.
 - Silently fall back to a degraded interactive wrapper when safety is uncertain.
 
@@ -30,7 +32,10 @@ The design prioritizes forward compatibility. If Codex adds commands or flags la
 
 ### Functional requirements
 
-- `ccx` must accept the same argv shape as `codex`.
+- `cdx` must accept the same argv shape as `codex` for wrapper-mode usage.
+- `cdx` without arguments must open the wrapped interactive Codex session.
+- `cdx manual` must open the current account-management UI.
+- `cdx smart-switch --json` must remain available as the stable machine-readable switching operation.
 - Non-interactive invocations must behave like transparent passthrough:
   - same stdout/stderr behavior
   - same exit code
@@ -38,17 +43,19 @@ The design prioritizes forward compatibility. If Codex adds commands or flags la
 - Interactive TTY invocations that are safe to wrap must support:
   - normal Codex session startup
   - `resume`
+  - `fork`
   - future interactive entrypoints when they are compatible with the same wrapping model
   - smart account switching on usage exhaustion
   - prompt restoration and optional autosubmit after switch
-  - additive prompt highlighting and switch banners
-  - `CCX` branding that is visible but stylistically consistent with the surrounding terminal and Codex UI
-- If `ccx` cannot prove a session is wrappable in a safe way, it must exit with a clear error and not start.
+  - additive prompt highlighting and bounded wrapper status UI
+- `ccx` may remain as a compatibility alias, but it must not become the canonical command.
+- If `cdx` cannot prove a session is wrappable in a safe way, it must exit with a clear error and not start.
 
 ### Quality requirements
 
 - Preserve native Codex controls such as arrows, escape handling, abort paths, and session navigation.
-- Preserve native shortcut semantics exactly, including the Codex-style double-`Ctrl+C` behavior where the first press interrupts the current interaction and only a subsequent press exits the wrapper.
+- Preserve native shortcut semantics exactly, including Codex-style double-`Ctrl+C` behavior.
+- Keep the everyday wrapper visually close to Codex; branding and heavier presentation belong in `cdx manual`, not in the wrapped TUI.
 - Avoid coupling core wrapper behavior to unstable internal Codex rendering details.
 - Confine unstable integrations behind adapters that can be replaced independently.
 - Ensure optional visual enhancements cannot break session correctness.
@@ -57,95 +64,136 @@ The design prioritizes forward compatibility. If Codex adds commands or flags la
 
 ### 1. Transparent by default
 
-`ccx` should act like a thin shell around `codex`, not a second CLI with its own command semantics.
+`cdx` should act like a thin shell around `codex`, not a second CLI with its own command semantics.
 
-### 2. Wrap only when safe
+### 2. Administration is not the default path
 
-Interactive wrapping is opt-in at runtime, based on capability checks and execution mode. If the checks fail, `ccx` must not launch.
+Account management remains important, but it should live behind `cdx manual`, not behind the top-level everyday command.
 
-### 3. Additive, never substitutive
+### 3. Wrap only when safe
 
-`ccx` may add behavior such as banners, prompt highlighting, and smart switching. It must not reinterpret or replace Codex output beyond those bounded additions.
+Interactive wrapping is opt-in at runtime, based on capability checks and execution mode. If the checks fail, `cdx` must not launch the interactive wrapper.
 
-Branding is allowed only as an additive layer. `CCX` identity should be recognizable, but never at the cost of native Codex affordances or terminal coherence.
+### 4. Additive, never substitutive
 
-### 4. Layered trust model
+`cdx` may add behavior such as prompt highlighting, switch banners, and smart switching. It must not reinterpret or replace Codex output beyond those bounded additions.
+
+### 5. Layered trust model
 
 All logic must prefer stable public interfaces first and use fragile heuristics only as fallback.
 
 ## Architectural Options Considered
 
-### Option A: Hardcode support per Codex subcommand
-
-`ccx` would explicitly know commands like `resume`, `fork`, and the default interactive mode, and special-case each one.
+### Option A: Keep current `cdx` as menu, add a new wrapper command
 
 Pros:
 
-- Easy to start with
-- Straightforward control flow
+- Lowest migration cost
+- Minimal disruption for current `cdx` users
 
 Cons:
 
-- Poor forward compatibility
-- High maintenance cost as Codex grows
-- Easy to miss new interactive entrypoints
+- Keeps the product split across multiple first-class commands
+- Leaves `cdx` misaligned with the new intended daily workflow
+- Makes long-term docs and discoverability worse
 
-### Option B: Infer behavior from argv patterns only
-
-`ccx` would classify commands by parsing argv and hand-maintained rules.
+### Option B: Make `cdx` the wrapper, move the menu to `cdx manual`, keep `ccx` as compatibility alias
 
 Pros:
 
-- Better than per-command branching
-- Moderate implementation complexity
+- Clean everyday UX
+- Best alignment with "replace `codex` with `cdx`"
+- Smooth migration path for existing `ccx` users
 
 Cons:
 
-- Still tied to the current Codex CLI shape
-- Brittle when Codex changes semantics without changing syntax
+- Requires CLI dispatch restructuring
+- Changes expectations for users who currently type `cdx` for the menu
 
-### Option C: Classify execution mode, then wrap by capability
-
-`ccx` decides between transparent passthrough and interactive wrapping based on execution mode, TTY context, and runtime-discovered capabilities. Interactive behavior depends on capabilities, not on a fixed list of known commands.
+### Option C: Remove `ccx` immediately and make `cdx` the only wrapper entrypoint
 
 Pros:
 
-- Best forward compatibility
-- Natural fit for "replace `codex` with `ccx`"
-- Clear separation between safe passthrough and smart wrapping
+- Cleanest command surface
+- No dual entrypoint ambiguity
 
 Cons:
 
-- Requires more careful architecture
-- Needs explicit capability probing and stronger boundaries
+- More abrupt migration
+- Higher chance of breaking current habits and local scripts
 
 ### Recommendation
 
-Choose Option C.
+Choose Option B.
 
-This is the only option that scales with Codex updates without turning `ccx` into a permanent compatibility chase.
+This gives `cdx` the right product shape without forcing an unnecessarily abrupt migration.
+
+## Command Model
+
+### Canonical command
+
+`cdx` becomes the canonical wrapper command.
+
+### Command mapping
+
+- `cdx`
+  - wrapped interactive Codex session
+- `cdx [same args as codex]`
+  - same invocation model as `codex [args]`
+- `cdx resume ...`
+  - wrapped interactive resume
+- `cdx fork ...`
+  - wrapped interactive fork
+- `cdx exec ...`
+  - transparent passthrough
+- `cdx review ...`
+  - transparent passthrough
+- `cdx mcp ...`
+  - transparent passthrough
+- `cdx marketplace ...`
+  - transparent passthrough
+- `cdx manual`
+  - current account-management UI
+- `cdx smart-switch --json`
+  - stable machine-readable switching API
+
+### Alias strategy
+
+- `ccx` should remain a compatibility alias during migration.
+- `ccx` should delegate to the same `cdx` wrapper entrypoint rather than keep separate logic.
+- `cxs` should not gain new hidden semantics; if kept, it should remain a simple alias to `cdx`.
 
 ## Proposed Architecture
 
-### 1. Invocation Classifier
+### 1. Dispatcher
 
 Purpose:
 
-- Inspect argv, TTY state, and discovered Codex capabilities.
-- Decide one of three outcomes:
-  - transparent passthrough
-  - interactive wrapped session
-  - explicit refusal to start
+- Inspect argv and TTY state.
+- Route to one of three destinations:
+  - Codex wrapper shell
+  - account manager UI
+  - non-interactive smart-switch API
 
 Rules:
 
-- Non-TTY or clearly non-interactive commands go to passthrough.
-- Interactive invocations go to wrapped mode only if required capabilities are present.
-- Ambiguous invocations that cannot be classified safely fail fast with a clear error.
+- `manual` routes to the account manager UI.
+- `smart-switch --json` routes to the machine-readable switching API.
+- Everything else is treated as Codex-wrapper traffic and classified there as passthrough vs wrapped interactive.
 
-This layer should remain small and deterministic. It must not contain account-switching logic.
+This layer should remain small and deterministic. It must not contain PTY logic or account-ranking logic.
 
-### 2. Transparent Codex Runner
+### 2. Codex Wrapper Shell
+
+Purpose:
+
+- Replace `codex` as the main command experience.
+- Decide between transparent passthrough and wrapped interactive mode.
+- Launch the real `codex`.
+
+This layer absorbs the current `ccx` role and becomes the product core of the new `cdx`.
+
+### 3. Transparent Codex Runner
 
 Purpose:
 
@@ -163,9 +211,9 @@ Scope:
 - `debug`
 - future non-interactive commands
 
-This is the compatibility backbone. If a Codex update adds a new non-interactive command, `ccx` should inherit support automatically through this lane.
+This is the compatibility backbone. If a Codex update adds a new non-interactive command, `cdx` should inherit support automatically through this lane.
 
-### 3. Interactive Session Supervisor
+### 4. Interactive Session Supervisor
 
 Purpose:
 
@@ -184,27 +232,43 @@ State owned here:
 
 This layer is transport and lifecycle infrastructure. It should not directly decide which account to pick.
 
-### 4. Smart Actions Engine
+### 5. Smart Actions Engine
 
 Purpose:
 
 - Orchestrate smart account behavior without owning the transport.
-- Ask `cdx` for recommendation or switching actions.
+- Ask the switching API for recommendation or switching actions.
 - Drive resume/autosubmit behavior after an exhaustion event.
 
 Responsibilities:
 
 - trigger switch flow on confirmed exhaustion
-- call the internal `cdx` smart-switch operation
+- call the internal smart-switch operation
 - reopen or resume the session
 - restore or autosubmit the pending prompt
-- emit additive banners for state transitions
+- emit bounded wrapper status UI for state transitions
 
 This isolates business logic from PTY mechanics.
 
+### 6. Account Manager UI
+
+Purpose:
+
+- Preserve and evolve the current `cdx` menu-driven account-management experience.
+
+Responsibilities:
+
+- switch manually
+- save/add/remove/rename/swap accounts
+- pin/exclude accounts
+- list accounts and live limits
+- show richer UI and product identity than the transparent wrapper path
+
+This subsystem should not own the wrapper transport logic.
+
 ## Capability and Trust Model
 
-`ccx` should consume information in descending order of trust:
+`cdx` should consume information in descending order of trust:
 
 ### Level 1: Public CLI contract
 
@@ -261,12 +325,12 @@ Behavior:
 
 - no smart features
 - no additional colors
-- no banners
+- no wrapper banners
 - no wrapping-specific logging on user-facing streams
 
 Success criterion:
 
-- the user should not be able to tell they ran `ccx` instead of `codex`, except by inspecting the parent process.
+- the user should not be able to tell they ran `cdx` instead of `codex`, except by inspecting the parent process.
 
 ### Mode B: Interactive Wrapped Mode
 
@@ -282,7 +346,7 @@ Behavior:
 - keep native controls working
 - add smart switching on usage exhaustion
 - optionally resume and autosubmit pending prompt
-- add visual enhancements such as prompt highlighting, restrained green `CCX` branding, and switch banners
+- add additive prompt highlighting and minimal wrapper status UI only where needed
 
 Core behaviors:
 
@@ -296,14 +360,23 @@ Core behaviors:
 Optional behaviors:
 
 - prompt highlighting
-- startup `CCX` banner
-- restrained green `CCX` accenting on wrapper-originated UI
-- decorative switch status UI
+- switch status lines
 - local diagnostics
 
 Optional behaviors must be individually disableable and must never jeopardize core correctness.
 
-### Mode C: Refuse to Start
+### Mode C: Manual Account Mode
+
+Conditions:
+
+- invocation is `cdx manual`
+
+Behavior:
+
+- open the current account-management UI
+- allow richer presentation and stronger product identity than the transparent wrapper path
+
+### Mode D: Refuse to Start
 
 Conditions:
 
@@ -315,7 +388,7 @@ Behavior:
 - print a clear error
 - exit without launching Codex
 
-This matches the product requirement that `ccx` must not start in a half-supported state.
+This matches the product requirement that `cdx` must not start in a half-supported state.
 
 ## Failure Model
 
@@ -325,7 +398,6 @@ The system should degrade by feature tier, not collapse globally.
 
 - prompt highlighting fails -> session continues without highlighting
 - switch banner formatting fails -> session continues without banner
-- non-essential `CCX` branding fails -> session continues without branding
 - non-essential diagnostics fail -> session continues silently
 
 ### Hard-stop failures
@@ -334,7 +406,7 @@ The system should degrade by feature tier, not collapse globally.
 - required capability for interactive wrapping is missing
 - session supervision cannot preserve native controls reliably
 
-In these cases, `ccx` must fail before starting the wrapped session.
+In these cases, `cdx` must fail before starting the wrapped session.
 
 ### Interactive runtime failures
 
@@ -359,16 +431,15 @@ Expected outcomes:
 - Internal session-log change:
   - handled inside one adapter
 - TUI rendering change:
-  - may affect optional styling, but must not break core wrapper behavior
+  - may affect optional wrapper enhancements, but must not break core wrapper behavior
 
 ## Component Boundaries
 
-The current codebase already hints at useful boundaries. The target architecture should formalize them further.
-
 ### Stable core modules
 
-- invocation classification
+- dispatcher
 - codex process launching
+- passthrough runner
 - PTY supervision
 - terminal state restore
 - signal forwarding
@@ -379,19 +450,31 @@ The current codebase already hints at useful boundaries. The target architecture
 - exhaustion detection orchestration
 - prompt persistence and autosubmit
 
+### Administrative modules
+
+- account manager UI
+- account store and repair
+- live-limit presentation
+
 ### Sacrificial modules
 
 - prompt highlighting
-- startup branding
 - decorative status lines
+- local diagnostics
 
 Sacrificial modules may be disabled automatically if they threaten correctness.
 
 ## Testing Strategy
 
+### Dispatcher tests
+
+- `cdx manual` routes to the account manager UI
+- `cdx smart-switch --json` routes to the machine-readable API
+- wrapper invocations route into wrapper classification
+
 ### Contract tests
 
-- `ccx` passthrough matches `codex` for representative non-interactive commands
+- `cdx` passthrough matches `codex` for representative non-interactive commands
 - exit codes are preserved
 - stdout/stderr behavior is preserved
 
@@ -405,12 +488,18 @@ Sacrificial modules may be disabled automatically if they threaten correctness.
 
 - normal startup
 - `resume`
+- `fork`
 - session reuse after switch
 - autosubmit after exhaustion
 - prompt continuity
 - signal and key behavior (`Esc`, arrows, `Ctrl+C`)
 - Codex-identical double-`Ctrl+C` semantics
-- branding remains visible without changing interactive control flow
+
+### Administrative UI tests
+
+- `cdx manual` preserves current account-management behavior
+- ranking and live-limit UI remain correct
+- account repair and cleanup remain intact
 
 ### Resilience tests
 
@@ -426,21 +515,23 @@ Sacrificial modules may be disabled automatically if they threaten correctness.
 
 ## Rollout Strategy
 
-### Phase 1: Formalize the lanes
+### Phase 1: Command model migration
 
-- make passthrough and interactive wrapped mode explicit
+- make `cdx` the wrapper entrypoint
+- move current menu UI to `cdx manual`
+- keep `ccx` as a compatibility alias
+
+### Phase 2: Formalize wrapper lanes
+
+- separate passthrough and interactive wrapped mode explicitly
 - isolate invocation classification
 - define the refusal path clearly
 
-### Phase 2: Capability registry
+### Phase 3: Capability registry and adapters
 
 - add runtime capability probing
 - move command assumptions out of ad-hoc branches
-
-### Phase 3: Adapter hardening
-
 - move session and prompt dependencies behind interfaces
-- reduce direct coupling to specific Codex internal files
 
 ### Phase 4: Optional feature isolation
 
@@ -456,12 +547,14 @@ Sacrificial modules may be disabled automatically if they threaten correctness.
 - Additional interactive entrypoints may be admitted later only through capability-based classification, not by weakening the safety bar.
 - Refusal errors should remain concise by default on user-facing stderr. Detailed diagnostics belong in debug logging, not in the normal launch path.
 - Adapter-level observability should be minimal by default and expanded only in explicit debug mode or local diagnostic logs.
+- The transparent wrapper path should stay visually close to Codex. Distinctive branding and richer graphics belong in `cdx manual`, not in the daily wrapped session.
 
 ## Decision Summary
 
-Build `ccx` as a transparent compatibility shell around `codex` with a strict two-lane runtime model:
+Build `cdx` as the main transparent compatibility shell around `codex` with a multi-lane runtime model:
 
 - transparent passthrough for non-interactive commands
 - guarded interactive wrapping for safe TUI sessions
+- `manual` mode for the current account-management UI
 
-Use capability discovery and adapter isolation to keep the design scalable as Codex evolves. Treat prompt styling and other visual enhancements as optional add-ons, not as foundations of correctness.
+Keep `ccx` only as a compatibility alias during migration. Use capability discovery and adapter isolation to keep the design scalable as Codex evolves. Treat prompt styling and other wrapper enhancements as optional add-ons, not as foundations of correctness.
