@@ -6,7 +6,9 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
+const { decideCdxMode } = require("../lib/cdx/dispatcher");
 const { runManualEntryPoint } = require("../lib/cdx/manual");
+const { runCodexWrapper } = require("../lib/cdx/wrapper");
 
 const CDX_DIR = process.env.CDX_DIR || path.join(os.homedir(), ".cdx");
 const ACCOUNTS_FILE = path.join(CDX_DIR, "accounts.json");
@@ -2397,28 +2399,16 @@ async function runInteractive(migration) {
 }
 
 async function main() {
-  const args = process.argv.slice(2);
-  const isSmartSwitchCommand = args[0] === "smart-switch";
-  const jsonOutput = args.includes("--json");
+  const mode = decideCdxMode({
+    args: process.argv.slice(2),
+    isTTY: process.stdin.isTTY && process.stdout.isTTY,
+  });
 
-  if (isSmartSwitchCommand) {
-    const unsupportedArgs = args.slice(1).filter((arg) => arg !== "--json");
-    if (unsupportedArgs.length > 0) {
-      die("usage: cdx smart-switch [--json]");
-    }
-
+  if (mode.kind === "smart-switch-json") {
     ensureState();
     try {
       const result = await runSmartSwitchOperation();
-      if (jsonOutput) {
-        process.stdout.write(`${JSON.stringify(result)}\n`);
-      } else if (result.ok && result.switched) {
-        process.stdout.write(`Switched '${result.from}' -> '${result.to}'\n`);
-      } else if (result.ok && result.alreadyOptimal) {
-        process.stdout.write(`Already using smart account '${result.to}'\n`);
-      } else {
-        process.stdout.write(`${getSmartSwitchFailureMessage(result)}\n`);
-      }
+      process.stdout.write(`${JSON.stringify(result)}\n`);
       process.exit(
         result.ok
           ? 0
@@ -2427,20 +2417,25 @@ async function main() {
     } catch (err) {
       die(err.message || String(err));
     }
+    return;
   }
 
-  if (args.length > 0) {
-    die("subcommands were removed. Run `cdx` with no arguments, or use `cdx smart-switch --json`.");
+  if (mode.kind === "manual") {
+    await runManualEntryPoint({
+      ensureState,
+      requireTTY,
+      runInteractive,
+      PromptCancelledError,
+      loadPrompts,
+      die,
+      exit: (code) => process.exit(code),
+    });
+    return;
   }
 
-  await runManualEntryPoint({
-    ensureState,
-    requireTTY,
-    runInteractive,
-    PromptCancelledError,
-    loadPrompts,
-    die,
-    exit: (code) => process.exit(code),
+  await runCodexWrapper({
+    argv: mode.forwardedArgs,
+    mainImpl: require("./ccx.js")._internalMain,
   });
 }
 

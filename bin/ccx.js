@@ -710,9 +710,15 @@ async function main({ forwardedArgs }) {
   await launchCodex(forwardedArgs);
 }
 
-runCodexWrapper({
-  argv: process.argv.slice(2),
-  mainImpl: main,
-}).catch((err) => {
-  die(err.message || String(err));
-});
+module.exports = {
+  _internalMain: main,
+};
+
+if (require.main === module) {
+  runCodexWrapper({
+    argv: process.argv.slice(2),
+    mainImpl: main,
+  }).catch((err) => {
+    die(err.message || String(err));
+  });
+}

@@ -1173,6 +1173,11 @@ await run("dispatches manual and smart-switch modes explicitly", async () => {
   );
 });
 
+await run("keeps smart-switch json as an explicit subcommand", async () => {
+  const { decideCdxMode } = require("../lib/cdx/dispatcher");
+  assert.equal(decideCdxMode({ args: ["smart-switch", "--json"], isTTY: false }).kind, "smart-switch-json");
+});
+
 await run("routes codex-style invocations to the wrapper lane", async () => {
   const { decideCdxMode } = require("../lib/cdx/dispatcher");
 
