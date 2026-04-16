@@ -1084,6 +1084,45 @@ await run("manual entrypoint handles prompt cancellation through prompts and inj
   assert.equal(exitCode, 1);
 });
 
+await run("manual entrypoint returns a status on prompt cancellation without exit injection", async () => {
+  const { runManualEntryPoint } = require("../lib/cdx/manual");
+  class PromptCancelledError extends Error {}
+
+  let cancelMessage = "";
+  const originalExit = process.exit;
+  process.exit = () => {
+    throw new Error("process.exit should not be called without an injected exit");
+  };
+
+  try {
+    const result = await runManualEntryPoint({
+      requireTTY() {},
+      ensureState() {
+        return { migrated: false, count: 0 };
+      },
+      async runInteractive() {
+        throw new PromptCancelledError();
+      },
+      PromptCancelledError,
+      async loadPrompts() {
+        return {
+          cancel(message) {
+            cancelMessage = message;
+          },
+        };
+      },
+      die(message) {
+        throw new Error(`die should not be called: ${message}`);
+      },
+    });
+
+    assert.equal(cancelMessage, "Operation cancelled");
+    assert.equal(result, 1);
+  } finally {
+    process.exit = originalExit;
+  }
+});
+
 await run("manual entrypoint routes non-cancel errors through die", async () => {
   const { runManualEntryPoint } = require("../lib/cdx/manual");
   class PromptCancelledError extends Error {}
