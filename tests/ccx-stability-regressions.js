@@ -38,8 +38,9 @@ run("normal output chunks are not buffered waiting for newlines", () => {
 run("footer badge still appears for real codex footer lines", () => {
   const transformer = createUserPromptOutputTransformer();
   assert.equal(transformer.transform("  gpt-5.4 xhigh"), "");
-  const output = transformer.transform(" · ~\\Documents\\repo\r\n");
+  const output = transformer.transform(" \u00b7 ~\\Documents\\repo\r\n");
   assert.match(output, /\u001b\[1;32mCDX\u001b\[0m/);
+  assert.match(output, /\u00b7 ~\\Documents\\repo/);
 });
 
 process.stdout.write("all cdx stability regression tests passed\n");
