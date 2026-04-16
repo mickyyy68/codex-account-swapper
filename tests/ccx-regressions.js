@@ -65,6 +65,7 @@ const {
   formatStartupBanner,
 } = require("../lib/ccx/startup-ui");
 const CDX_BIN_PATH = path.resolve(__dirname, "..", "bin", "cdx.js");
+const CCX_BIN_PATH = path.resolve(__dirname, "..", "bin", "ccx.js");
 
 function mkTempDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -128,6 +129,14 @@ async function main() {
   await run("exports a shared cdx wrapper entrypoint", async () => {
     const wrapper = require("../lib/cdx/wrapper");
     assert.equal(typeof wrapper.runCodexWrapper, "function");
+  });
+
+  await run("keeps bin/ccx as a compatibility alias over the shared wrapper core", async () => {
+    const ccx = require(CCX_BIN_PATH);
+    const source = fs.readFileSync(CCX_BIN_PATH, "utf8");
+
+    assert.equal(typeof ccx._internalMain, "function");
+    assert.match(source, /if \(require\.main === module\)/);
   });
 
   await run("runCodexWrapper forwards argv to mainImpl and returns its result", async () => {
