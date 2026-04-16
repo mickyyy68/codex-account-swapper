@@ -2421,6 +2421,9 @@ async function main() {
   }
 
   if (mode.kind === "manual") {
+    if (mode.forwardedArgs.length > 0) {
+      die("usage: cdx manual");
+    }
     await runManualEntryPoint({
       ensureState,
       requireTTY,
