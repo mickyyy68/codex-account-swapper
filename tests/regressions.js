@@ -1010,6 +1010,39 @@ await run("builds switch account options from live limits and reuses cache", asy
   );
 });
 
+await run("dispatches manual and smart-switch modes explicitly", async () => {
+  const { decideCdxMode } = require("../lib/cdx/dispatcher");
+
+  assert.deepEqual(
+    decideCdxMode({ args: ["manual"], isTTY: true }),
+    { kind: "manual", forwardedArgs: [] },
+  );
+
+  assert.deepEqual(
+    decideCdxMode({ args: ["smart-switch", "--json"], isTTY: false }),
+    { kind: "smart-switch-json", forwardedArgs: [] },
+  );
+});
+
+await run("routes codex-style invocations to the wrapper lane", async () => {
+  const { decideCdxMode } = require("../lib/cdx/dispatcher");
+
+  assert.deepEqual(
+    decideCdxMode({ args: [], isTTY: true }),
+    { kind: "wrapper", forwardedArgs: [] },
+  );
+
+  assert.deepEqual(
+    decideCdxMode({ args: ["resume", "--last"], isTTY: true }),
+    { kind: "wrapper", forwardedArgs: ["resume", "--last"] },
+  );
+
+  assert.deepEqual(
+    decideCdxMode({ args: ["exec", "print('hi')"], isTTY: false }),
+    { kind: "wrapper", forwardedArgs: ["exec", "print('hi')"] },
+  );
+});
+
 process.stdout.write("all regression tests passed\n");
 }
 
