@@ -15,6 +15,7 @@ User-facing contract:
 - Preserve native Codex behavior by default.
 - Add smart account-switching behavior only when `ccx` can wrap an interactive session safely.
 - Refuse to start instead of launching a half-broken wrapper.
+- Make it visually clear that the user is inside `CCX`, using restrained green accents and `CCX` ASCII branding without breaking terminal coherence.
 
 The design prioritizes forward compatibility. If Codex adds commands or flags later, `ccx` should usually inherit them automatically without needing command-specific support.
 
@@ -41,11 +42,13 @@ The design prioritizes forward compatibility. If Codex adds commands or flags la
   - smart account switching on usage exhaustion
   - prompt restoration and optional autosubmit after switch
   - additive prompt highlighting and switch banners
+  - `CCX` branding that is visible but stylistically consistent with the surrounding terminal and Codex UI
 - If `ccx` cannot prove a session is wrappable in a safe way, it must exit with a clear error and not start.
 
 ### Quality requirements
 
 - Preserve native Codex controls such as arrows, escape handling, abort paths, and session navigation.
+- Preserve native shortcut semantics exactly, including the Codex-style double-`Ctrl+C` behavior where the first press interrupts the current interaction and only a subsequent press exits the wrapper.
 - Avoid coupling core wrapper behavior to unstable internal Codex rendering details.
 - Confine unstable integrations behind adapters that can be replaced independently.
 - Ensure optional visual enhancements cannot break session correctness.
@@ -63,6 +66,8 @@ Interactive wrapping is opt-in at runtime, based on capability checks and execut
 ### 3. Additive, never substitutive
 
 `ccx` may add behavior such as banners, prompt highlighting, and smart switching. It must not reinterpret or replace Codex output beyond those bounded additions.
+
+Branding is allowed only as an additive layer. `CCX` identity should be recognizable, but never at the cost of native Codex affordances or terminal coherence.
 
 ### 4. Layered trust model
 
@@ -277,7 +282,7 @@ Behavior:
 - keep native controls working
 - add smart switching on usage exhaustion
 - optionally resume and autosubmit pending prompt
-- add visual enhancements such as prompt highlighting and switch banners
+- add visual enhancements such as prompt highlighting, restrained green `CCX` branding, and switch banners
 
 Core behaviors:
 
@@ -286,11 +291,13 @@ Core behaviors:
 - prompt continuity
 - safe switching
 - native signal behavior
+- native shortcut semantics
 
 Optional behaviors:
 
 - prompt highlighting
 - startup `CCX` banner
+- restrained green `CCX` accenting on wrapper-originated UI
 - decorative switch status UI
 - local diagnostics
 
@@ -318,6 +325,7 @@ The system should degrade by feature tier, not collapse globally.
 
 - prompt highlighting fails -> session continues without highlighting
 - switch banner formatting fails -> session continues without banner
+- non-essential `CCX` branding fails -> session continues without branding
 - non-essential diagnostics fail -> session continues silently
 
 ### Hard-stop failures
@@ -401,6 +409,8 @@ Sacrificial modules may be disabled automatically if they threaten correctness.
 - autosubmit after exhaustion
 - prompt continuity
 - signal and key behavior (`Esc`, arrows, `Ctrl+C`)
+- Codex-identical double-`Ctrl+C` semantics
+- branding remains visible without changing interactive control flow
 
 ### Resilience tests
 
