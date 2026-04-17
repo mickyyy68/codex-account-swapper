@@ -81,6 +81,7 @@ const DISCOVERY_INTERVAL_MS = 250;
 const DISCOVERY_TIMEOUT_MS = 30_000;
 const SESSION_ID_WAIT_TIMEOUT_MS = 30_000;
 const OUTPUT_BUFFER_MAX_CHARS = 16_000;
+const USAGE_LIMIT_MESSAGE_RE = /\byou'?ve hit your usage limit\b/i;
 
 function die(message) {
   process.stderr.write(`cdx: ${message}\n`);
@@ -121,6 +122,10 @@ function writeDebugLog(event, fields = {}) {
 
 function writeStatusLine(message) {
   process.stdout.write(`\r\n${message}\r\n`);
+}
+
+function hasOutputUsageLimitMessage(outputBuffer) {
+  return USAGE_LIMIT_MESSAGE_RE.test(stripAnsi(outputBuffer));
 }
 
 async function runLocalCdxSmartSwitchJson() {
@@ -292,6 +297,17 @@ async function main({ forwardedArgs }) {
 
     const observer = createSessionObserver({
       readSessionState: readCurrentSessionState,
+      hasStructuredSessionSignal: () => !!state.sessionFilePath,
+      readOutputUsageLimitBridge: () => {
+        if (state.sessionFilePath || !hasOutputUsageLimitMessage(state.outputBuffer)) {
+          return null;
+        }
+        return {
+          prompt: pendingPrompt,
+          source: "output",
+          message: "You've hit your usage limit.",
+        };
+      },
       onUsageLimitExceeded: (event) => {
         writeDebugLog("usage_watch_completed", {
           matched: true,

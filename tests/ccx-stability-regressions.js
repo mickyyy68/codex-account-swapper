@@ -206,6 +206,55 @@ run("observer emits exhaustion only from structured session state", async () => 
   assert.equal(events[0].sessionState.latestUserMessage, "leggi il progetto");
 });
 
+run("observer bridges output usage-limit detection only before structured session state exists", async () => {
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
+  let latestState = null;
+  let outputBridgeMatched = true;
+  const events = [];
+
+  const observer = createSessionObserver({
+    readSessionState: () => latestState,
+    hasStructuredSessionSignal: () => !!latestState,
+    readOutputUsageLimitBridge: () => (
+      outputBridgeMatched
+        ? { prompt: "ponte output", source: "output" }
+        : null
+    ),
+    onUsageLimitExceeded: (event) => events.push(event),
+    intervalMs: 5,
+  });
+
+  observer.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(events.length, 1);
+  assert.equal(events[0].prompt, "ponte output");
+  assert.equal(events[0].source, "output");
+
+  latestState = {
+    latestUserMessage: "stato strutturato",
+  };
+  outputBridgeMatched = true;
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  observer.stop();
+
+  assert.equal(events.length, 1);
+});
+
+run("session state usage-limit detection falls back to historical message text", () => {
+  const { isSessionStateUsageLimitExceeded } = require("../lib/ccx/session-log");
+
+  assert.equal(
+    isSessionStateUsageLimitExceeded({
+      latestError: {
+        code: "different_error",
+        message: "You've hit your usage limit. Try again later.",
+      },
+    }),
+    true,
+  );
+});
+
 Promise.all(pendingRuns)
   .then(() => {
     process.stdout.write("all cdx stability regression tests passed\n");
