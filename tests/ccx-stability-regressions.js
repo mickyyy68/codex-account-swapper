@@ -206,6 +206,35 @@ run("observer emits exhaustion only from structured session state", async () => 
   assert.equal(events[0].sessionState.latestUserMessage, "leggi il progetto");
 });
 
+run("observer emits exhaustion from message-text-only usage-limit state", async () => {
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
+  let latestState = null;
+  const events = [];
+
+  const observer = createSessionObserver({
+    readSessionState: () => latestState,
+    onUsageLimitExceeded: (event) => events.push(event),
+    intervalMs: 5,
+  });
+
+  observer.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  latestState = {
+    latestError: {
+      message: "You have hit your usage limit.",
+    },
+    latestUserMessage: "leggi il progetto",
+  };
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  observer.stop();
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].prompt, "leggi il progetto");
+  assert.equal(events[0].sessionState.latestError.message, "You have hit your usage limit.");
+});
+
 run("observer bridges output usage-limit detection only before structured session state exists", async () => {
   const { createSessionObserver } = require("../lib/ccx/session-observer");
   let latestState = null;
@@ -239,6 +268,16 @@ run("observer bridges output usage-limit detection only before structured sessio
   observer.stop();
 
   assert.equal(events.length, 1);
+});
+
+run("pre-session output bridge matches historical usage-limit phrasings", () => {
+  const { _internal } = require("../bin/ccx.js");
+  const hasOutputUsageLimitMessage = _internal && _internal.hasOutputUsageLimitMessage;
+
+  assert.equal(typeof hasOutputUsageLimitMessage, "function");
+  assert.equal(hasOutputUsageLimitMessage("You have hit your usage limit."), true);
+  assert.equal(hasOutputUsageLimitMessage("Please purchase more credits or visit settings/usage."), true);
+  assert.equal(hasOutputUsageLimitMessage("Your usage limit was reached. Please try again at 9:00 PM."), true);
 });
 
 run("session state usage-limit detection falls back to historical message text", () => {

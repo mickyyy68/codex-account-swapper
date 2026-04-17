@@ -81,7 +81,16 @@ const DISCOVERY_INTERVAL_MS = 250;
 const DISCOVERY_TIMEOUT_MS = 30_000;
 const SESSION_ID_WAIT_TIMEOUT_MS = 30_000;
 const OUTPUT_BUFFER_MAX_CHARS = 16_000;
-const USAGE_LIMIT_MESSAGE_RE = /\byou'?ve hit your usage limit\b/i;
+
+function hasOutputUsageLimitMessage(outputBuffer) {
+  const text = stripAnsi(outputBuffer).toLowerCase();
+  return (
+    text.includes("you've hit your usage limit") ||
+    text.includes("you have hit your usage limit") ||
+    (text.includes("usage limit") && text.includes("try again at")) ||
+    (text.includes("purchase more credits") && text.includes("settings/usage"))
+  );
+}
 
 function die(message) {
   process.stderr.write(`cdx: ${message}\n`);
@@ -122,10 +131,6 @@ function writeDebugLog(event, fields = {}) {
 
 function writeStatusLine(message) {
   process.stdout.write(`\r\n${message}\r\n`);
-}
-
-function hasOutputUsageLimitMessage(outputBuffer) {
-  return USAGE_LIMIT_MESSAGE_RE.test(stripAnsi(outputBuffer));
 }
 
 async function runLocalCdxSmartSwitchJson() {
@@ -717,6 +722,9 @@ async function main({ forwardedArgs }) {
 
 module.exports = {
   _internalMain: main,
+  _internal: {
+    hasOutputUsageLimitMessage,
+  },
 };
 
 if (require.main === module) {
