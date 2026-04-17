@@ -534,7 +534,7 @@ async function main({ forwardedArgs }) {
     observer.start();
   }
 
-  async function launchCodex(args, options = {}) {
+  async function launchCodex(args) {
     const startedAtMs = Date.now();
     state.launchNonce += 1;
     const currentLaunchNonce = state.launchNonce;
@@ -649,8 +649,6 @@ async function main({ forwardedArgs }) {
       pendingPrompt,
     });
 
-    const canonicalPrompt = resolveUsageLimitPromptForState(state, { prompt: pendingPrompt });
-
     const previousSessionId = sessionIdentity.sessionId;
     if (state.ptyProcess) {
       const childToClose = state.ptyProcess;
@@ -678,10 +676,7 @@ async function main({ forwardedArgs }) {
       });
       writeStatusLine(formatFailureBanner(`Smart switch failed: ${err.message || String(err)}`));
       try {
-        await launchCodex(["resume", previousSessionId], {
-          prefillText: canonicalPrompt,
-          autoSubmitPrefill: false,
-        });
+        await launchCodex(["resume", previousSessionId]);
       } finally {
         releaseSwitchingStateForState(state, ensureSessionObserverRunning);
       }
@@ -730,10 +725,7 @@ async function main({ forwardedArgs }) {
     if (!result || !result.ok) {
       writeStatusLine(formatDecisionBanner(result));
       try {
-        await launchCodex(["resume", previousSessionId], {
-          prefillText: canonicalPrompt,
-          autoSubmitPrefill: false,
-        });
+        await launchCodex(["resume", previousSessionId]);
       } finally {
         releaseSwitchingStateForState(state, ensureSessionObserverRunning);
       }
@@ -756,10 +748,7 @@ async function main({ forwardedArgs }) {
 
     state.draftBuffer = "";
     try {
-      await launchCodex(["resume", previousSessionId], {
-        prefillText: canonicalPrompt,
-        autoSubmitPrefill: false,
-      });
+      await launchCodex(["resume", previousSessionId]);
     } finally {
       releaseSwitchingStateForState(state, ensureSessionObserverRunning);
     }
