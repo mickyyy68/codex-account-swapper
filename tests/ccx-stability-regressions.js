@@ -145,6 +145,14 @@ run("footer badge survives a short model-prefix PTY split", () => {
   assert.match(output, /gpt-5\.4 xhigh \u00b7 ~\\repo/);
 });
 
+run("complete footer tails without a trailing newline stay buffered for the badge", () => {
+  const pipeline = createOutputPipeline({ enableFooterBadge: true });
+  assert.equal(pipeline.transform("  gpt-5.4 xhigh \u00b7 ~\\repo"), "");
+  const output = pipeline.transform("\r\n");
+  assert.match(output, /\u001b\[1;32mCDX\u001b\[0m/);
+  assert.match(output, /gpt-5\.4 xhigh \u00b7 ~\\repo/);
+});
+
 run("disproven footer prefixes flush without badge", () => {
   const pipeline = createOutputPipeline({ enableFooterBadge: true });
   assert.equal(pipeline.transform("  gpt-5.4"), "");
