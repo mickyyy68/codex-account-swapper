@@ -669,6 +669,53 @@ run("resumed sessions baseline at eof instead of replaying historical lines", ()
   assert.equal(tracker.getState().sessionStateBaselineSize, 512);
 });
 
+run("tracker can accept an output-derived session id without losing pending discovery", () => {
+  const { createSessionIdentityTracker } = require("../lib/ccx/session-identity");
+  const tracker = createSessionIdentityTracker();
+
+  tracker.markAwaitingDiscovery();
+  tracker.setSessionId("sess-from-output");
+
+  assert.deepEqual(tracker.getState(), {
+    sessionId: "sess-from-output",
+    sessionFilePath: "",
+    sessionStateBaselineSize: 0,
+    sessionStateBaselinePendingDiscovery: true,
+  });
+});
+
+run("deferred baseline capture keys off tracker pending discovery instead of stale wrapper mirrors", () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const { createSessionIdentityTracker } = require("../lib/ccx/session-identity");
+  const { _internal } = require("../bin/ccx.js");
+
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccx-stability-canonical-pending-"));
+  const sessionFile = path.join(tempRoot, "canonical-pending.jsonl");
+  fs.writeFileSync(sessionFile, "", "utf8");
+
+  const tracker = createSessionIdentityTracker();
+  tracker.markAwaitingDiscovery();
+  tracker.setSessionId("sess-from-output");
+
+  const state = {
+    sessionId: "stale-wrapper-id",
+    sessionFilePath: sessionFile,
+    sessionStateBaselineSize: 0,
+    sessionStateBaselinePendingDiscovery: false,
+    sessionStatePreserveDiscoveredTail: true,
+    sessionIdentityTracker: tracker,
+  };
+
+  _internal.captureDeferredSessionStateBaselineForState(state);
+
+  assert.equal(state.sessionId, "sess-from-output");
+  assert.equal(state.sessionFilePath, sessionFile);
+  assert.equal(state.sessionStateBaselineSize, 0);
+  assert.equal(state.sessionStateBaselinePendingDiscovery, false);
+});
+
 run("input submit clears stale canonical prompt cache without submit-time watcher mutations", () => {
   const { _internal } = require("../bin/ccx.js");
 

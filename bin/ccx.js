@@ -293,19 +293,20 @@ function processInputChunkForState(state, data) {
 
 function captureDeferredSessionStateBaselineForState(state) {
   const tracker = ensureSessionIdentityTracker(state, { syncFromTracker: false });
-  if (!tracker || !state.sessionFilePath || state.sessionStateBaselinePendingDiscovery !== true) {
+  const identityState = tracker ? tracker.getState() : null;
+  if (!tracker || !state.sessionFilePath || !identityState || identityState.sessionStateBaselinePendingDiscovery !== true) {
     return 0;
   }
   try {
     if (state.sessionStatePreserveDiscoveredTail === true) {
       tracker.attachDiscoveredSession({
-        sessionId: state.sessionId || "",
+        sessionId: identityState.sessionId || "",
         sessionFilePath: state.sessionFilePath,
         preserveDiscoveredTail: true,
       });
     } else {
       tracker.attachResumedSession({
-        sessionId: state.sessionId || "",
+        sessionId: identityState.sessionId || "",
         sessionFilePath: state.sessionFilePath,
         currentSize: fs.statSync(state.sessionFilePath).size,
       });
@@ -315,7 +316,7 @@ function captureDeferredSessionStateBaselineForState(state) {
     return state.sessionStateBaselineSize;
   } catch (_) {
     tracker.attachDiscoveredSession({
-      sessionId: state.sessionId || "",
+      sessionId: identityState.sessionId || "",
       sessionFilePath: state.sessionFilePath || "",
       preserveDiscoveredTail: true,
     });
@@ -330,19 +331,17 @@ function captureSessionStateBaselineForState(state, options = {}) {
   if (!tracker) {
     return 0;
   }
+  const identityState = tracker.getState();
   const preserveDiscoveredTail = options && options.preserveDiscoveredTail === true;
   if (!state.sessionFilePath) {
     tracker.markAwaitingDiscovery();
-    if (state.sessionId) {
-      state.sessionId = "";
-    }
     syncSessionIdentityState(state);
     state.sessionStatePreserveDiscoveredTail = preserveDiscoveredTail;
     return 0;
   }
   if (preserveDiscoveredTail) {
     tracker.attachDiscoveredSession({
-      sessionId: state.sessionId || "",
+      sessionId: identityState.sessionId || "",
       sessionFilePath: state.sessionFilePath,
       preserveDiscoveredTail: true,
     });
@@ -352,7 +351,7 @@ function captureSessionStateBaselineForState(state, options = {}) {
   }
   try {
     tracker.attachResumedSession({
-      sessionId: state.sessionId || "",
+      sessionId: identityState.sessionId || "",
       sessionFilePath: state.sessionFilePath,
       currentSize: fs.statSync(state.sessionFilePath).size,
     });
@@ -527,14 +526,21 @@ async function main({ forwardedArgs }) {
   }
 
   function updateSessionIdentityFromOutput() {
-    if (state.sessionId) {
+    const tracker = ensureSessionIdentityTracker(state, { syncFromTracker: false });
+    const identityState = tracker ? tracker.getState() : null;
+    if (identityState && identityState.sessionId) {
       return;
     }
     const resumeSessionId = extractResumeSessionId(state.outputBuffer);
     if (!resumeSessionId) {
       return;
     }
-    state.sessionId = resumeSessionId;
+    if (tracker) {
+      tracker.setSessionId(resumeSessionId);
+      syncSessionIdentityState(state);
+    } else {
+      state.sessionId = resumeSessionId;
+    }
     writeDebugLog("session_id_from_output", { sessionId: resumeSessionId });
     ensureSessionObserverRunning();
   }
@@ -654,7 +660,6 @@ async function main({ forwardedArgs }) {
     ensureSessionIdentityTracker(state, { syncFromTracker: false });
     state.sessionIdentityTracker.markAwaitingDiscovery();
     syncSessionIdentityState(state);
-    state.sessionStateBaselinePendingDiscovery = false;
     state.sessionStatePreserveDiscoveredTail = false;
     state.outputBuffer = "";
     cancelUsageLimitWatch();
