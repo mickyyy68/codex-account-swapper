@@ -1,38 +1,30 @@
 #!/usr/bin/env node
 "use strict";
 
+const assert = require("node:assert/strict");
 const { spawnSync } = require("node:child_process");
 
-const defaultResult = spawnSync(process.execPath, ["bin/cdx.js"], { encoding: "utf8" });
-const manualResult = spawnSync(process.execPath, ["bin/cdx.js", "manual"], { encoding: "utf8" });
-const manualExtraResult = spawnSync(process.execPath, ["bin/cdx.js", "manual", "extra"], { encoding: "utf8" });
+function run(name, argv, checks) {
+  const result = spawnSync(process.execPath, ["bin/cdx.js", ...argv], { encoding: "utf8" });
+  if (result.error) {
+    throw new Error(`${name}: ${result.error.message}`);
+  }
 
-const defaultOutput = `${defaultResult.stdout || ""}${defaultResult.stderr || ""}`;
-if (defaultResult.status !== 1) {
-  process.exit(1);
-}
-if (!/ccx: interactive terminal required/i.test(defaultOutput)) {
-  process.exit(1);
-}
-if (/cdx: interactive terminal required/i.test(defaultOutput)) {
-  process.exit(1);
+  const output = `${result.stdout || ""}${result.stderr || ""}`;
+  assert.equal(result.status, 1, `${name}: expected exit status 1`);
+  checks(output);
 }
 
-const manualOutput = `${manualResult.stdout || ""}${manualResult.stderr || ""}`;
-if (manualResult.status !== 1) {
-  process.exit(1);
-}
-if (!/cdx: interactive terminal required/i.test(manualOutput)) {
-  process.exit(1);
-}
-if (/ccx: interactive terminal required/i.test(manualOutput)) {
-  process.exit(1);
-}
+run("default", [], (output) => {
+  assert.match(output, /cdx: interactive terminal required/i);
+  assert.doesNotMatch(output, /ccx: interactive terminal required/i);
+});
 
-const manualExtraOutput = `${manualExtraResult.stdout || ""}${manualExtraResult.stderr || ""}`;
-if (manualExtraResult.status !== 1) {
-  process.exit(1);
-}
-if (!/usage: cdx manual/i.test(manualExtraOutput)) {
-  process.exit(1);
-}
+run("manual", ["manual"], (output) => {
+  assert.match(output, /cdx: interactive terminal required/i);
+  assert.doesNotMatch(output, /ccx: interactive terminal required/i);
+});
+
+run("manual extra", ["manual", "extra"], (output) => {
+  assert.match(output, /usage: cdx manual/i);
+});
