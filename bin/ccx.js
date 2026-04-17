@@ -223,6 +223,18 @@ function readCurrentSessionStateForState(state) {
   }
 }
 
+function readOutputUsageLimitBridgeForState(state, pendingPrompt) {
+  if (!state || typeof state !== "object" || !hasOutputUsageLimitMessage(state.outputBuffer)) {
+    return null;
+  }
+
+  return {
+    prompt: pendingPrompt,
+    source: "output",
+    message: "You've hit your usage limit.",
+  };
+}
+
 async function main({ forwardedArgs }) {
   requireTTY();
   writeStatusLine(formatStartupBanner());
@@ -327,16 +339,7 @@ async function main({ forwardedArgs }) {
     const observer = createSessionObserver({
       readSessionState: readCurrentSessionState,
       hasStructuredSessionSignal: hasActionableStructuredSessionState,
-      readOutputUsageLimitBridge: () => {
-        if (state.sessionFilePath || !hasOutputUsageLimitMessage(state.outputBuffer)) {
-          return null;
-        }
-        return {
-          prompt: pendingPrompt,
-          source: "output",
-          message: "You've hit your usage limit.",
-        };
-      },
+      readOutputUsageLimitBridge: () => readOutputUsageLimitBridgeForState(state, pendingPrompt),
       onUsageLimitExceeded: (event) => {
         writeDebugLog("usage_watch_completed", {
           matched: true,
@@ -753,6 +756,7 @@ module.exports = {
     captureSessionStateBaselineForState,
     captureDeferredSessionStateBaselineForState,
     readCurrentSessionStateForState,
+    readOutputUsageLimitBridgeForState,
   },
 };
 

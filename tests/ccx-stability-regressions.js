@@ -337,6 +337,46 @@ run("observer keeps the output bridge active until structured session state is r
   );
 });
 
+run("known session file path does not disable the output bridge before structured state becomes actionable", async () => {
+  const {
+    createSessionObserver,
+    hasActionableStructuredSessionState,
+  } = require("../lib/ccx/session-observer");
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.readOutputUsageLimitBridgeForState, "function");
+
+  const state = {
+    sessionFilePath: "C:\\Users\\filmd\\.codex\\sessions\\2026\\04\\17\\session.jsonl",
+    outputBuffer: "You've hit your usage limit. Try again later.",
+  };
+  const structuredState = {
+    latestUserMessage: "leggi il progetto",
+  };
+  const events = [];
+
+  const observer = createSessionObserver({
+    readSessionState: () => structuredState,
+    hasStructuredSessionSignal: (sessionState) => hasActionableStructuredSessionState(sessionState),
+    readOutputUsageLimitBridge: () => _internal.readOutputUsageLimitBridgeForState(state, "leggi il progetto"),
+    onUsageLimitExceeded: (event) => events.push(event),
+    intervalMs: 5,
+  });
+
+  observer.start();
+  const deadline = Date.now() + 50;
+  while (Date.now() < deadline && events.length === 0) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  observer.stop();
+
+  assert.equal(state.sessionFilePath.length > 0, true);
+  assert.equal(hasActionableStructuredSessionState(structuredState), false);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].source, "output");
+  assert.equal(events[0].prompt, "leggi il progetto");
+});
+
 run("pre-session output bridge matches historical usage-limit phrasings", () => {
   const { _internal } = require("../bin/ccx.js");
   const hasOutputUsageLimitMessage = _internal && _internal.hasOutputUsageLimitMessage;
