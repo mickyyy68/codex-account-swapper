@@ -66,6 +66,7 @@ const {
   formatStartupBanner,
 } = require("../lib/ccx/startup-ui");
 const {
+  hasActionableStructuredSessionState,
   createSessionObserver,
 } = require("../lib/ccx/session-observer");
 const {
@@ -302,7 +303,7 @@ async function main({ forwardedArgs }) {
 
     const observer = createSessionObserver({
       readSessionState: readCurrentSessionState,
-      hasStructuredSessionSignal: (sessionState) => !!sessionState,
+      hasStructuredSessionSignal: hasActionableStructuredSessionState,
       readOutputUsageLimitBridge: () => {
         if (state.sessionFilePath || !hasOutputUsageLimitMessage(state.outputBuffer)) {
           return null;

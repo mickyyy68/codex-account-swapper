@@ -233,15 +233,15 @@ run("observer emits exhaustion from message-text-only usage-limit state", async 
 });
 
 run("observer keeps the output bridge active until structured session state is readable", async () => {
-  const { createSessionObserver } = require("../lib/ccx/session-observer");
+  const {
+    createSessionObserver,
+    hasActionableStructuredSessionState,
+  } = require("../lib/ccx/session-observer");
   const structuredStates = [
     null,
-    null,
-    null,
+    {},
     {
-      latestError: null,
       latestUserMessage: "stato strutturato",
-      rateLimits: null,
     },
   ];
   let readCount = 0;
@@ -253,7 +253,7 @@ run("observer keeps the output bridge active until structured session state is r
     readSessionState: () => structuredStates[Math.min(readCount++, structuredStates.length - 1)],
     hasStructuredSessionSignal: (sessionState) => {
       structuredSignalArgs.push(sessionState);
-      return !!sessionState;
+      return hasActionableStructuredSessionState(sessionState);
     },
     readOutputUsageLimitBridge: () => {
       bridgeCalls += 1;
@@ -283,7 +283,7 @@ run("observer keeps the output bridge active until structured session state is r
   assert.equal(events.length, 1);
   assert.equal(events[0].prompt, "ponte output");
   assert.equal(events[0].source, "output");
-  assert.deepEqual(structuredSignalArgs.slice(0, 3), [null, null, null]);
+  assert.deepEqual(structuredSignalArgs.slice(0, 2), [null, {}]);
   assert.equal(structuredSignalArgs.some((state) => state && state.latestUserMessage === "stato strutturato"), true);
 });
 
