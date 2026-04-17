@@ -19,7 +19,6 @@ const {
   listSessionFilesRecursive,
   findMatchingSessionFile,
   findSessionFileById,
-  readLatestSessionStateFromSessionFile,
   readLatestSessionStateFromSessionFileAfterSize,
   readLatestUserMessageFromSessionFile,
 } = require("../lib/ccx/session-log");
@@ -173,10 +172,55 @@ function createSupervisor() {
     sessionId: "",
     sessionFilePath: "",
     sessionStateBaselineSize: 0,
+    sessionStateBaselinePendingDiscovery: false,
     sessionObserver: null,
     launchNonce: 0,
     shuttingDown: false,
   };
+}
+
+function captureDeferredSessionStateBaselineForState(state) {
+  if (!state || typeof state !== "object" || !state.sessionFilePath || state.sessionStateBaselinePendingDiscovery !== true) {
+    return 0;
+  }
+  try {
+    state.sessionStateBaselineSize = fs.statSync(state.sessionFilePath).size;
+    state.sessionStateBaselinePendingDiscovery = false;
+    return state.sessionStateBaselineSize;
+  } catch (_) {
+    state.sessionStateBaselineSize = 0;
+    return 0;
+  }
+}
+
+function captureSessionStateBaselineForState(state) {
+  if (!state || typeof state !== "object") {
+    return 0;
+  }
+  if (!state.sessionFilePath) {
+    state.sessionStateBaselineSize = 0;
+    state.sessionStateBaselinePendingDiscovery = true;
+    return 0;
+  }
+  state.sessionStateBaselinePendingDiscovery = true;
+  return captureDeferredSessionStateBaselineForState(state);
+}
+
+function readCurrentSessionStateForState(state) {
+  if (!state || typeof state !== "object" || !state.sessionFilePath) {
+    return null;
+  }
+
+  captureDeferredSessionStateBaselineForState(state);
+
+  try {
+    return readLatestSessionStateFromSessionFileAfterSize(
+      state.sessionFilePath,
+      state.sessionStateBaselineSize,
+    );
+  } catch (_) {
+    return null;
+  }
 }
 
 async function main({ forwardedArgs }) {
@@ -241,20 +285,7 @@ async function main({ forwardedArgs }) {
   }
 
   function readCurrentSessionState() {
-    if (!state.sessionFilePath) {
-      return null;
-    }
-    try {
-      if (state.sessionStateBaselineSize > 0) {
-        return readLatestSessionStateFromSessionFileAfterSize(
-          state.sessionFilePath,
-          state.sessionStateBaselineSize,
-        );
-      }
-      return readLatestSessionStateFromSessionFile(state.sessionFilePath);
-    } catch (_) {
-      return null;
-    }
+    return readCurrentSessionStateForState(state);
   }
 
   function getCanonicalSubmittedPrompt(fallbackPrompt) {
@@ -282,15 +313,7 @@ async function main({ forwardedArgs }) {
   }
 
   function captureSessionStateBaseline() {
-    if (!state.sessionFilePath) {
-      state.sessionStateBaselineSize = 0;
-      return;
-    }
-    try {
-      state.sessionStateBaselineSize = fs.statSync(state.sessionFilePath).size;
-    } catch (_) {
-      state.sessionStateBaselineSize = 0;
-    }
+    captureSessionStateBaselineForState(state);
   }
 
   function armUsageLimitWatch(pendingPrompt) {
@@ -355,6 +378,7 @@ async function main({ forwardedArgs }) {
     state.sessionId = "";
     state.sessionFilePath = "";
     state.sessionStateBaselineSize = 0;
+    state.sessionStateBaselinePendingDiscovery = false;
     state.outputBuffer = "";
     cancelUsageLimitWatch();
     const prefillText = typeof options.prefillText === "string" ? options.prefillText : "";
@@ -482,6 +506,7 @@ async function main({ forwardedArgs }) {
         }
         state.sessionId = match.id;
         state.sessionFilePath = match.filePath;
+        captureDeferredSessionStateBaselineForState(state);
       })
       .catch(() => {});
 
@@ -725,6 +750,9 @@ module.exports = {
   _internalMain: main,
   _internal: {
     hasOutputUsageLimitMessage,
+    captureSessionStateBaselineForState,
+    captureDeferredSessionStateBaselineForState,
+    readCurrentSessionStateForState,
   },
 };
 

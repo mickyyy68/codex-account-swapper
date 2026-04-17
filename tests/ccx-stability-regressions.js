@@ -361,6 +361,114 @@ run("session state usage-limit detection falls back to historical message text",
   );
 });
 
+run("delayed session discovery captures the baseline before stale log lines can trigger autoswitch", async () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
+  const { _internal } = require("../bin/ccx.js");
+
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccx-stability-delayed-discovery-"));
+  const sessionFile = path.join(tempRoot, "2026", "04", "17", "rollout.jsonl");
+  fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+  fs.writeFileSync(
+    sessionFile,
+    [
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:00.000Z",
+        type: "session_meta",
+        payload: {
+          id: "sess-delayed-discovery",
+          timestamp: "2026-04-17T10:00:00.000Z",
+          cwd: "C:\\repo",
+          originator: "codex-tui",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:01.000Z",
+        type: "event_msg",
+        payload: {
+          type: "error",
+          message: "You've hit your usage limit. Try again later.",
+          codex_error_info: "usage_limit_exceeded",
+        },
+      }),
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const state = {
+    sessionFilePath: "",
+    sessionStateBaselineSize: 0,
+    sessionStateBaselinePendingDiscovery: false,
+  };
+  const events = [];
+
+  assert.equal(typeof _internal.captureSessionStateBaselineForState, "function");
+  assert.equal(typeof _internal.captureDeferredSessionStateBaselineForState, "function");
+  assert.equal(typeof _internal.readCurrentSessionStateForState, "function");
+
+  _internal.captureSessionStateBaselineForState(state);
+  assert.equal(state.sessionStateBaselineSize, 0);
+  assert.equal(state.sessionStateBaselinePendingDiscovery, true);
+
+  const observer = createSessionObserver({
+    readSessionState: () => _internal.readCurrentSessionStateForState(state),
+    onUsageLimitExceeded: (event) => events.push(event),
+    intervalMs: 5,
+  });
+
+  observer.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(events.length, 0);
+
+  state.sessionFilePath = sessionFile;
+  const discoveredBaselineSize = fs.statSync(sessionFile).size;
+  _internal.captureDeferredSessionStateBaselineForState(state);
+
+  assert.equal(state.sessionStateBaselineSize, discoveredBaselineSize);
+  assert.equal(state.sessionStateBaselinePendingDiscovery, false);
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(events.length, 0);
+
+  fs.appendFileSync(
+    sessionFile,
+    [
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:02.000Z",
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: "retry now",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:03.000Z",
+        type: "event_msg",
+        payload: {
+          type: "error",
+          message: "You've hit your usage limit. Try again later.",
+          codex_error_info: "usage_limit_exceeded",
+        },
+      }),
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const deadline = Date.now() + 200;
+  while (Date.now() < deadline && events.length === 0) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  observer.stop();
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].prompt, "retry now");
+  assert.equal(events[0].sessionState.latestError.code, "usage_limit_exceeded");
+});
+
 Promise.all(pendingRuns)
   .then(() => {
     process.stdout.write("all cdx stability regression tests passed\n");
