@@ -145,13 +145,13 @@ run("minimal wrapper no longer imports prompt restore helpers in the autoswitch 
   assert.doesNotMatch(source, /formatHighlightedUserPrompt/);
 });
 
-run("autoswitch reopen branches call resume without prompt options", () => {
+run("strict autoswitch resumes through the orchestrator without prompt options", () => {
   const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
 
-  const reopenCallPattern = /await launchCodex\(\["resume", previousSessionId\]\);/g;
-  const reopenCalls = source.match(reopenCallPattern) || [];
-
-  assert.equal(reopenCalls.length >= 3, true);
+  assert.match(
+    source,
+    /createSwitchOrchestrator\(\{[\s\S]*resumeSession:\s*async\s*\(resumeSessionId\)\s*=>\s*\{\s*await launchCodex\(\["resume", resumeSessionId\]\);\s*\}/,
+  );
   assert.doesNotMatch(source, /prefillText:/);
   assert.doesNotMatch(source, /autoSubmitPrefill:/);
 });
@@ -423,9 +423,12 @@ run("delayed new-session discovery preserves the initial post-launch tail for pr
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(events.length, 0);
 
-  state.sessionFilePath = sessionFile;
   const discoveredBaselineSize = fs.statSync(sessionFile).size;
-  _internal.captureDeferredSessionStateBaselineForState(state);
+  _internal.applyObservedSessionIdentityForState(state, {
+    sessionId: "sess-delayed-discovery",
+    sessionFilePath: sessionFile,
+    preserveDiscoveredTail: true,
+  });
 
   assert.equal(discoveredBaselineSize > 0, true);
   assert.equal(state.sessionStateBaselineSize, 0);
@@ -571,6 +574,45 @@ run("resumed sessions baseline at eof instead of replaying historical lines", ()
   });
 
   assert.equal(tracker.getState().sessionStateBaselineSize, 512);
+});
+
+run("strict autoswitch refuses to proceed without canonical identity", async () => {
+  const { createSwitchOrchestrator } = require("../lib/ccx/switch-orchestrator");
+  const calls = [];
+  const orchestrator = createSwitchOrchestrator({
+    closeSession: async () => calls.push("close"),
+    runSmartSwitch: async () => ({ ok: true, from: "1", to: "2" }),
+    resumeSession: async () => calls.push("resume"),
+    verifyResumedSession: async () => true,
+  });
+
+  await assert.rejects(
+    () => orchestrator.handleExhaustion({ sessionId: "", sessionFilePath: "" }),
+    /canonical session identity/i,
+  );
+  assert.deepEqual(calls, []);
+});
+
+run("strict autoswitch errors when resumed session id does not match", async () => {
+  const { createSwitchOrchestrator } = require("../lib/ccx/switch-orchestrator");
+  const orchestrator = createSwitchOrchestrator({
+    closeSession: async () => {},
+    runSmartSwitch: async () => ({ ok: true, from: "1", to: "2" }),
+    resumeSession: async () => {},
+    verifyResumedSession: async () => false,
+  });
+
+  await assert.rejects(
+    () => orchestrator.handleExhaustion({ sessionId: "sess-1", sessionFilePath: "C:\\tmp\\sess-1.jsonl" }),
+    /same sessionid/i,
+  );
+});
+
+run("strict autoswitch path does not attempt fallback accounts", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  assert.doesNotMatch(source, /chooseFallbackAccount/);
+  assert.doesNotMatch(source, /shouldAttemptFallbackAccount/);
 });
 
 run("tracker can accept an output-derived session id without losing pending discovery", () => {
@@ -872,14 +914,10 @@ run("session observer arming depends on session identity not submit-time prompt 
   );
 });
 
-run("usage-limit handling waits until a canonical prompt is recoverable", () => {
-  const fs = require("node:fs");
-  const os = require("node:os");
-  const path = require("node:path");
+run("usage-limit handling waits until canonical session identity is available", () => {
   const { _internal } = require("../bin/ccx.js");
 
   assert.equal(typeof _internal.shouldHandleUsageLimitEventForState, "function");
-  assert.equal(typeof _internal.resolveUsageLimitPromptForState, "function");
   assert.equal(typeof _internal.syncObservedSessionStateForState, "function");
 
   const earlyWindowState = {
@@ -891,23 +929,10 @@ run("usage-limit handling waits until a canonical prompt is recoverable", () => 
   };
 
   assert.equal(
-    _internal.resolveUsageLimitPromptForState(earlyWindowState, {
-      prompt: "",
-    }),
-    "",
-  );
-  assert.equal(
-    _internal.shouldHandleUsageLimitEventForState(earlyWindowState, {
-      prompt: "",
-    }),
-    false,
-  );
-
-  assert.equal(
     _internal.shouldHandleUsageLimitEventForState(earlyWindowState, {
       prompt: "prompt from observer event",
     }),
-    true,
+    false,
   );
 
   _internal.syncObservedSessionStateForState(earlyWindowState, {
@@ -917,36 +942,10 @@ run("usage-limit handling waits until a canonical prompt is recoverable", () => 
     _internal.shouldHandleUsageLimitEventForState(earlyWindowState, {
       prompt: "",
     }),
-    true,
+    false,
   );
 
-  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccx-stability-handle-usage-limit-"));
-  const sessionFile = path.join(tempRoot, "recoverable-session.jsonl");
-  fs.writeFileSync(
-    sessionFile,
-    [
-      JSON.stringify({
-        timestamp: "2026-04-17T10:00:00.000Z",
-        type: "session_meta",
-        payload: {
-          id: "sess-file-recovery",
-          timestamp: "2026-04-17T10:00:00.000Z",
-          cwd: "C:\\repo",
-          originator: "codex-tui",
-        },
-      }),
-      JSON.stringify({
-        timestamp: "2026-04-17T10:00:01.000Z",
-        type: "event_msg",
-        payload: {
-          type: "user_message",
-          message: "prompt recovered from session file",
-        },
-      }),
-      "",
-    ].join("\n"),
-    "utf8",
-  );
+  const sessionFile = "C:\\tmp\\recoverable-session.jsonl";
 
   assert.equal(
     _internal.shouldHandleUsageLimitEventForState({
@@ -958,7 +957,7 @@ run("usage-limit handling waits until a canonical prompt is recoverable", () => 
     }, {
       prompt: "",
     }),
-    false,
+    true,
   );
   assert.equal(
     _internal.shouldHandleUsageLimitEventForState({

@@ -19,10 +19,6 @@ const {
   waitForChildExit,
 } = require("../lib/ccx/runtime");
 const {
-  chooseFallbackAccount,
-  shouldAttemptFallbackAccount,
-} = require("../lib/ccx/fallback");
-const {
   extractResumeSessionId,
 } = require("../lib/ccx/prompt-state");
 const {
@@ -38,7 +34,6 @@ const {
 const {
   formatSwitchingBanner,
   formatDecisionBanner,
-  formatFailureBanner,
 } = require("../lib/ccx/status-ui");
 const {
   restoreTerminalState,
@@ -55,6 +50,9 @@ const {
 const {
   createSessionIdentityTracker,
 } = require("../lib/ccx/session-identity");
+const {
+  createSwitchOrchestrator,
+} = require("../lib/ccx/switch-orchestrator");
 
 const CODEX_HOME_DIR = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const SESSIONS_DIR = path.join(CODEX_HOME_DIR, "sessions");
@@ -470,16 +468,16 @@ function applyObservedSessionIdentityForState(state, sessionIdentity = {}) {
 }
 
 function shouldHandleUsageLimitEventForState(state, eventOrPrompt = "") {
-  const canonicalPrompt = typeof eventOrPrompt === "string"
-    ? eventOrPrompt
-    : resolveUsageLimitPromptForState(state, eventOrPrompt);
+  const sessionIdentity = resolveSessionIdentityForState(state);
 
   return Boolean(
     state &&
     typeof state === "object" &&
     !state.switching &&
     !state.shuttingDown &&
-    canonicalPrompt
+    sessionIdentity &&
+    sessionIdentity.sessionId &&
+    sessionIdentity.sessionFilePath
   );
 }
 
@@ -613,7 +611,7 @@ async function main({ forwardedArgs }) {
       source: "session",
     });
 
-    await reopenWithSmartSwitch(canonicalPrompt);
+    await reopenWithSmartSwitch();
   }
 
   function ensureSessionObserverRunning() {
@@ -746,7 +744,7 @@ async function main({ forwardedArgs }) {
     };
   }
 
-  async function reopenWithSmartSwitch(pendingPrompt) {
+  async function reopenWithSmartSwitch() {
     if (state.switching) {
       return;
     }
@@ -763,100 +761,64 @@ async function main({ forwardedArgs }) {
     );
 
     if (!sessionIdentity) {
-      releaseSwitchingStateForState(state, ensureSessionObserverRunning);
-      writeDebugLog("smart_switch_skipped_no_session", {});
-      writeStatusLine(formatFailureBanner("Session id not available after waiting, skipping smart switch guard."));
-      return;
+      throw new Error("canonical session identity is required before autoswitch");
     }
 
     writeDebugLog("smart_switch_started", {
       sessionId: sessionIdentity.sessionId,
       sessionFilePath: sessionIdentity.sessionFilePath,
-      pendingPrompt,
     });
-
-    const previousSessionId = sessionIdentity.sessionId;
-    if (state.ptyProcess) {
-      const childToClose = state.ptyProcess;
-      try {
-        childToClose.kill();
-      } catch (_) {
-        // ignore
-      }
-      await waitForChildExit(childToClose, { timeoutMs: 1500 });
-      if (state.ptyProcess === childToClose) {
-        state.ptyProcess = null;
-      }
-      restoreTerminalState(process.stdout);
-    }
 
     writeStatusLine(formatSwitchingBanner());
 
-    let result;
-    try {
-      result = await runLocalCdxSmartSwitchJson();
-    } catch (err) {
-      writeDebugLog("smart_switch_runtime_error", {
-        sessionId: sessionIdentity.sessionId,
-        message: err.message || String(err),
-      });
-      writeStatusLine(formatFailureBanner(`Smart switch failed: ${err.message || String(err)}`));
-      try {
-        await launchCodex(["resume", previousSessionId]);
-      } finally {
-        releaseSwitchingStateForState(state, ensureSessionObserverRunning);
-      }
-      return;
-    }
-
-    if (!result || !result.ok) {
-      const fallbackTarget = shouldAttemptFallbackAccount(result)
-        ? chooseFallbackAccount(cdxInternal.readAccounts(), result && result.from ? result.from : cdxInternal.getActive())
-        : "";
-      writeDebugLog("smart_switch_result", {
-        ok: !!(result && result.ok),
-        reason: result && result.reason ? result.reason : "",
-        from: result && result.from ? result.from : "",
-        to: result && result.to ? result.to : "",
-        fallbackTarget,
-      });
-      if (fallbackTarget) {
+    const orchestrator = createSwitchOrchestrator({
+      closeSession: async () => {
+        if (!state.ptyProcess) {
+          return;
+        }
+        const childToClose = state.ptyProcess;
         try {
-          const message = cdxInternal.opUse(fallbackTarget);
-          result = {
-            ok: true,
-            switched: true,
-            alreadyOptimal: false,
-            allExhausted: false,
-            from: result && result.from ? result.from : "",
-            to: fallbackTarget,
-            reason: "fallback",
-            activeStatus: result ? result.activeStatus : null,
-            recommendedStatus: result ? result.recommendedStatus : null,
-            message,
-          };
-          writeDebugLog("smart_switch_fallback_applied", {
-            from: result.from,
-            to: fallbackTarget,
-          });
+          childToClose.kill();
+        } catch (_) {
+          // ignore
+        }
+        await waitForChildExit(childToClose, { timeoutMs: 1500 });
+        if (state.ptyProcess === childToClose) {
+          state.ptyProcess = null;
+        }
+        restoreTerminalState(process.stdout);
+      },
+      runSmartSwitch: async () => {
+        try {
+          return await runLocalCdxSmartSwitchJson();
         } catch (err) {
-          writeDebugLog("smart_switch_fallback_failed", {
-            target: fallbackTarget,
+          writeDebugLog("smart_switch_runtime_error", {
+            sessionId: sessionIdentity.sessionId,
             message: err.message || String(err),
           });
+          throw err;
         }
-      }
-    }
+      },
+      resumeSession: async (resumeSessionId) => {
+        await launchCodex(["resume", resumeSessionId]);
+      },
+      verifyResumedSession: async (expectedSessionId) => {
+        const resumedIdentity = await waitForTruthyValue(
+          () => {
+            updateSessionIdentityFromOutput();
+            return resolveSessionIdentityForState(state);
+          },
+          { timeoutMs: SESSION_ID_WAIT_TIMEOUT_MS, intervalMs: 100 },
+        );
+        return Boolean(
+          resumedIdentity &&
+          resumedIdentity.sessionId &&
+          resumedIdentity.sessionId === expectedSessionId
+        );
+      },
+    });
 
-    if (!result || !result.ok) {
-      writeStatusLine(formatDecisionBanner(result));
-      try {
-        await launchCodex(["resume", previousSessionId]);
-      } finally {
-        releaseSwitchingStateForState(state, ensureSessionObserverRunning);
-      }
-      return;
-    }
+    const result = await orchestrator.handleExhaustion(sessionIdentity);
 
     writeDebugLog("smart_switch_result", {
       ok: true,
@@ -872,12 +834,7 @@ async function main({ forwardedArgs }) {
       );
     }
 
-    state.draftBuffer = "";
-    try {
-      await launchCodex(["resume", previousSessionId]);
-    } finally {
-      releaseSwitchingStateForState(state, ensureSessionObserverRunning);
-    }
+    releaseSwitchingStateForState(state, ensureSessionObserverRunning);
   }
 
   async function onInput(data) {
