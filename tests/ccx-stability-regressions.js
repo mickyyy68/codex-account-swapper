@@ -349,6 +349,7 @@ run("known session file path does not disable the output bridge before structure
   const state = {
     sessionFilePath: "C:\\Users\\filmd\\.codex\\sessions\\2026\\04\\17\\session.jsonl",
     outputBuffer: "You've hit your usage limit. Try again later.",
+    lastSubmittedPrompt: "leggi il progetto",
   };
   const structuredState = {
     latestUserMessage: "leggi il progetto",
@@ -358,7 +359,7 @@ run("known session file path does not disable the output bridge before structure
   const observer = createSessionObserver({
     readSessionState: () => structuredState,
     hasStructuredSessionSignal: (sessionState) => hasActionableStructuredSessionState(sessionState),
-    readOutputUsageLimitBridge: () => _internal.readOutputUsageLimitBridgeForState(state, "leggi il progetto"),
+    readOutputUsageLimitBridge: () => _internal.readOutputUsageLimitBridgeForState(state),
     onUsageLimitExceeded: (event) => events.push(event),
     intervalMs: 5,
   });
@@ -507,6 +508,13 @@ run("delayed session discovery captures the baseline before stale log lines can 
   assert.equal(events.length, 1);
   assert.equal(events[0].prompt, "retry now");
   assert.equal(events[0].sessionState.latestError.code, "usage_limit_exceeded");
+});
+
+run("input path no longer depends on visible prompt fallback for submit semantics", () => {
+  const fs = require("node:fs");
+  const source = fs.readFileSync("bin/ccx.js", "utf8");
+
+  assert.doesNotMatch(source, /resolvePendingPrompt\(state\.draftBuffer,\s*state\.outputBuffer\)/);
 });
 
 Promise.all(pendingRuns)

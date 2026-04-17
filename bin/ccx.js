@@ -32,7 +32,6 @@ const {
   shouldAttemptFallbackAccount,
 } = require("../lib/ccx/fallback");
 const {
-  resolvePendingPrompt,
   extractResumeSessionId,
   extractVisiblePromptDraft,
 } = require("../lib/ccx/prompt-state");
@@ -41,18 +40,17 @@ const {
   chunkRequestsAbort,
   chunkRequestsEscape,
   getForwardingChunks,
-  getForwardingOverride,
   hasDraftText,
 } = require("../lib/ccx/input-buffer");
 const {
   createPrefillController,
 } = require("../lib/ccx/prefill");
 const {
-  formatHighlightedUserPrompt,
-} = require("../lib/ccx/output-style");
-const {
   createOutputPipeline,
 } = require("../lib/ccx/output-pipeline");
+const {
+  formatHighlightedUserPrompt,
+} = require("../lib/ccx/output-style");
 const {
   formatSwitchingBanner,
   formatDecisionBanner,
@@ -223,13 +221,13 @@ function readCurrentSessionStateForState(state) {
   }
 }
 
-function readOutputUsageLimitBridgeForState(state, pendingPrompt) {
+function readOutputUsageLimitBridgeForState(state) {
   if (!state || typeof state !== "object" || !hasOutputUsageLimitMessage(state.outputBuffer)) {
     return null;
   }
 
   return {
-    prompt: pendingPrompt,
+    prompt: state.lastSubmittedPrompt || "",
     source: "output",
     message: "You've hit your usage limit.",
   };
@@ -328,19 +326,36 @@ async function main({ forwardedArgs }) {
     captureSessionStateBaselineForState(state);
   }
 
-  function armUsageLimitWatch(pendingPrompt) {
+  async function handleUsageLimitExceeded(event) {
+    const observedPrompt = event && typeof event.prompt === "string" ? event.prompt : "";
+    const canonicalPrompt = getCanonicalSubmittedPrompt(observedPrompt || state.lastSubmittedPrompt);
+
+    state.lastSubmittedPrompt = "";
+    writeDebugLog("usage_watch_triggered", {
+      sessionId: state.sessionId,
+      sessionFilePath: state.sessionFilePath,
+      observedPrompt,
+      canonicalPrompt,
+      source: event && event.source ? event.source : "session",
+    });
+
+    await reopenWithSmartSwitch(canonicalPrompt);
+  }
+
+  function armUsageLimitWatch() {
     cancelUsageLimitWatch();
     writeDebugLog("usage_watch_armed", {
       sessionId: state.sessionId,
       sessionFilePath: state.sessionFilePath,
-      pendingPrompt,
+      pendingPrompt: state.lastSubmittedPrompt,
     });
 
     const observer = createSessionObserver({
       readSessionState: readCurrentSessionState,
       hasStructuredSessionSignal: hasActionableStructuredSessionState,
-      readOutputUsageLimitBridge: () => readOutputUsageLimitBridgeForState(state, pendingPrompt),
+      readOutputUsageLimitBridge: () => readOutputUsageLimitBridgeForState(state),
       onUsageLimitExceeded: (event) => {
+        const pendingPrompt = state.lastSubmittedPrompt;
         writeDebugLog("usage_watch_completed", {
           matched: true,
           cancelled: false,
@@ -348,21 +363,14 @@ async function main({ forwardedArgs }) {
           sessionFilePath: state.sessionFilePath,
           pendingPrompt,
         });
-        if (state.switching || state.shuttingDown || state.lastSubmittedPrompt !== pendingPrompt) {
+        if (state.switching || state.shuttingDown || !pendingPrompt) {
           return;
         }
-        state.lastSubmittedPrompt = "";
-        writeDebugLog("usage_watch_triggered", {
-          sessionId: state.sessionId,
-          sessionFilePath: state.sessionFilePath,
-          pendingPrompt,
-          canonicalPrompt: event && event.prompt ? event.prompt : "",
-        });
         observer.stop();
         if (state.sessionObserver === observer) {
           state.sessionObserver = null;
         }
-        Promise.resolve(reopenWithSmartSwitch(event && event.prompt ? event.prompt : pendingPrompt)).catch((err) => {
+        Promise.resolve(handleUsageLimitExceeded(event)).catch((err) => {
           writeDebugLog("usage_watch_error", { message: err.message || String(err) });
           cleanup();
           die(err.message || String(err));
@@ -657,24 +665,10 @@ async function main({ forwardedArgs }) {
         state.outputBuffer = "";
         captureSessionStateBaseline();
         writeStatusLine(formatHighlightedUserPrompt(submittedPrompt));
-        armUsageLimitWatch(submittedPrompt);
+        armUsageLimitWatch();
       },
     });
     state.switching = false;
-  }
-
-  async function maybeHandleEnter(text, pendingPrompt) {
-    if (state.ptyProcess) {
-      state.lastSubmittedPrompt = pendingPrompt;
-      state.draftBuffer = "";
-      state.outputBuffer = "";
-      captureSessionStateBaseline();
-      writeStatusLine(formatHighlightedUserPrompt(pendingPrompt));
-      for (const chunk of getForwardingChunks(text)) {
-        state.ptyProcess.write(chunk);
-      }
-      armUsageLimitWatch(pendingPrompt);
-    }
   }
 
   async function onInput(data) {
@@ -698,31 +692,24 @@ async function main({ forwardedArgs }) {
       raw: JSON.stringify(text),
     });
     const inputState = applyInputChunk(state.draftBuffer, text);
-    state.draftBuffer = escapeRequested ? "" : inputState.draft;
+    const submittedPrompt = inputState.submitted && hasDraftText(inputState.draft)
+      ? String(inputState.draft || "")
+      : "";
+    state.draftBuffer = (escapeRequested || inputState.submitted) ? "" : inputState.draft;
     if (escapeRequested && state.outputTransformer && typeof state.outputTransformer.reset === "function") {
       state.outputTransformer.reset();
       state.outputBuffer = "";
     }
 
-    if (inputState.submitted) {
-      const pendingPrompt = resolvePendingPrompt(state.draftBuffer, state.outputBuffer);
+    if (submittedPrompt) {
+      state.lastSubmittedPrompt = submittedPrompt;
+      state.outputBuffer = "";
+      captureSessionStateBaseline();
       writeDebugLog("input_submit", {
-        pendingPrompt,
-        draftBuffer: state.draftBuffer,
+        pendingPrompt: submittedPrompt,
+        draftBuffer: submittedPrompt,
       });
-      if (!pendingPrompt) {
-        for (const chunk of getForwardingChunks(text)) {
-          state.ptyProcess.write(chunk);
-        }
-        return;
-      }
-      try {
-        await maybeHandleEnter(text, pendingPrompt);
-      } catch (err) {
-        cleanup();
-        die(err.message || String(err));
-      }
-      return;
+      armUsageLimitWatch();
     }
 
     for (const chunk of getForwardingChunks(text)) {
