@@ -730,6 +730,27 @@ run("coalesced submit chunk preserves only the pre-submit prompt and keeps trail
   assert.equal(state.lastSubmittedPrompt, "");
 });
 
+run("coalesced repeated submit chunk submits the first prompt and leaves only post-final-submit draft state", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.processInputChunkForState, "function");
+
+  const state = {
+    draftBuffer: "",
+    lastSubmittedPrompt: "stale observer prompt",
+    outputBuffer: "stale output",
+    outputTransformer: null,
+  };
+
+  const result = _internal.processInputChunkForState(state, "hello\rworld\r");
+
+  assert.equal(result.submittedPrompt, "hello");
+  assert.deepEqual(result.forwardingChunks, ["hello\rworld\r"]);
+  assert.equal(state.draftBuffer, "");
+  assert.equal(state.outputBuffer, "");
+  assert.equal(state.lastSubmittedPrompt, "");
+});
+
 run("leading submit chunk keeps trailing draft bytes without inventing a submitted prompt", () => {
   const { _internal } = require("../bin/ccx.js");
 

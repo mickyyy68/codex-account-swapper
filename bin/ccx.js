@@ -191,30 +191,53 @@ function findFirstSubmitBoundaryIndex(text) {
   return -1;
 }
 
+function reduceInputChunkState(initialDraft, text) {
+  let draft = String(initialDraft || "");
+  let submittedPrompt = "";
+  let sawSubmitBoundary = false;
+  let remaining = String(text || "");
+
+  while (remaining) {
+    const boundaryIndex = findFirstSubmitBoundaryIndex(remaining);
+    if (boundaryIndex < 0) {
+      draft = applyInputChunk(draft, remaining).draft;
+      break;
+    }
+
+    const boundaryState = applyInputChunk(draft, remaining.slice(0, boundaryIndex));
+    if (!sawSubmitBoundary && hasDraftText(boundaryState.draft)) {
+      submittedPrompt = String(boundaryState.draft || "");
+    }
+
+    sawSubmitBoundary = true;
+    draft = "";
+    remaining = remaining.slice(boundaryIndex);
+  }
+
+  return {
+    draft,
+    submittedPrompt,
+    submitted: sawSubmitBoundary,
+  };
+}
+
 function processInputChunkForState(state, data) {
   const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
   const escapeRequested = chunkRequestsEscape(text);
-  const firstSubmitBoundaryIndex = findFirstSubmitBoundaryIndex(text);
-  const submittedChunk = firstSubmitBoundaryIndex >= 0 ? text.slice(0, firstSubmitBoundaryIndex) : text;
-  const trailingChunk = firstSubmitBoundaryIndex >= 0 ? text.slice(firstSubmitBoundaryIndex) : "";
-  const submittedState = applyInputChunk(state.draftBuffer, submittedChunk);
-  const trailingState = trailingChunk ? applyInputChunk("", trailingChunk) : null;
-  const submittedPrompt = submittedState.submitted && hasDraftText(submittedState.draft)
-    ? String(submittedState.draft || "")
-    : "";
+  const chunkState = reduceInputChunkState(state.draftBuffer, text);
 
   if (escapeRequested) {
     state.draftBuffer = "";
-  } else if (submittedState.submitted) {
-    state.draftBuffer = trailingState ? trailingState.draft : "";
+  } else if (chunkState.submitted) {
+    state.draftBuffer = chunkState.draft;
   } else {
-    state.draftBuffer = submittedState.draft;
+    state.draftBuffer = chunkState.draft;
   }
 
   if (escapeRequested && state.outputTransformer && typeof state.outputTransformer.reset === "function") {
     state.outputTransformer.reset();
     state.outputBuffer = "";
-  } else if (submittedPrompt) {
+  } else if (chunkState.submittedPrompt) {
     state.lastSubmittedPrompt = "";
     state.outputBuffer = "";
   }
@@ -222,7 +245,7 @@ function processInputChunkForState(state, data) {
   return {
     text,
     escapeRequested,
-    submittedPrompt,
+    submittedPrompt: chunkState.submittedPrompt,
     forwardingChunks: getForwardingChunks(text),
   };
 }
