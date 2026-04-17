@@ -642,6 +642,33 @@ run("resume baseline still ignores historical pre-launch session lines", async (
   assert.equal(events[0].prompt, "fresh prompt");
 });
 
+run("new-session discovery preserves the post-launch tail", () => {
+  const { createSessionIdentityTracker } = require("../lib/ccx/session-identity");
+  const tracker = createSessionIdentityTracker();
+
+  tracker.markAwaitingDiscovery();
+  tracker.attachDiscoveredSession({
+    sessionId: "sess-new",
+    sessionFilePath: "C:\\tmp\\new.jsonl",
+    preserveDiscoveredTail: true,
+  });
+
+  assert.equal(tracker.getState().sessionStateBaselineSize, 0);
+});
+
+run("resumed sessions baseline at eof instead of replaying historical lines", () => {
+  const { createSessionIdentityTracker } = require("../lib/ccx/session-identity");
+  const tracker = createSessionIdentityTracker();
+
+  tracker.attachResumedSession({
+    sessionId: "sess-resume",
+    sessionFilePath: "C:\\tmp\\resume.jsonl",
+    currentSize: 512,
+  });
+
+  assert.equal(tracker.getState().sessionStateBaselineSize, 512);
+});
+
 run("input submit clears stale canonical prompt cache without submit-time watcher mutations", () => {
   const { _internal } = require("../bin/ccx.js");
 

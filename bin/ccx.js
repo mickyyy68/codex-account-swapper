@@ -53,6 +53,9 @@ const {
 const {
   ensureCurrentAuthRegistered,
 } = require("../lib/ccx/current-account");
+const {
+  createSessionIdentityTracker,
+} = require("../lib/ccx/session-identity");
 
 const CODEX_HOME_DIR = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const SESSIONS_DIR = path.join(CODEX_HOME_DIR, "sessions");
@@ -157,6 +160,8 @@ async function discoverSessionFile(cwd, startedAtMs, launchNonceRef, excludedFil
 }
 
 function createSupervisor() {
+  const identityTracker = createSessionIdentityTracker();
+  const identityState = identityTracker.getState();
   return {
     ptyProcess: null,
     outputTransformer: null,
@@ -164,15 +169,58 @@ function createSupervisor() {
     lastSubmittedPrompt: "",
     outputBuffer: "",
     switching: false,
-    sessionId: "",
-    sessionFilePath: "",
-    sessionStateBaselineSize: 0,
-    sessionStateBaselinePendingDiscovery: false,
+    sessionId: identityState.sessionId,
+    sessionFilePath: identityState.sessionFilePath,
+    sessionStateBaselineSize: identityState.sessionStateBaselineSize,
+    sessionStateBaselinePendingDiscovery: identityState.sessionStateBaselinePendingDiscovery,
     sessionStatePreserveDiscoveredTail: false,
+    sessionIdentityTracker: identityTracker,
     sessionObserver: null,
     launchNonce: 0,
     shuttingDown: false,
   };
+}
+
+function syncSessionIdentityState(state) {
+  if (!state || typeof state !== "object" || !state.sessionIdentityTracker) {
+    return state;
+  }
+  const identityState = state.sessionIdentityTracker.getState();
+  state.sessionId = identityState.sessionId;
+  state.sessionFilePath = identityState.sessionFilePath;
+  state.sessionStateBaselineSize = identityState.sessionStateBaselineSize;
+  state.sessionStateBaselinePendingDiscovery = identityState.sessionStateBaselinePendingDiscovery;
+  return state;
+}
+
+function ensureSessionIdentityTracker(state, options = {}) {
+  if (!state || typeof state !== "object") {
+    return null;
+  }
+  const syncFromTracker = options.syncFromTracker !== false;
+  if (!state.sessionIdentityTracker) {
+    const tracker = createSessionIdentityTracker();
+    let shouldSync = false;
+    if (state.sessionStateBaselinePendingDiscovery === true) {
+      tracker.markAwaitingDiscovery();
+    } else if (state.sessionId || state.sessionFilePath || state.sessionStateBaselineSize) {
+      tracker.attachResumedSession({
+        sessionId: state.sessionId || "",
+        sessionFilePath: state.sessionFilePath || "",
+        currentSize: state.sessionStateBaselineSize || 0,
+      });
+      shouldSync = true;
+    }
+    state.sessionIdentityTracker = tracker;
+    if (shouldSync) {
+      syncSessionIdentityState(state);
+    }
+    return state.sessionIdentityTracker;
+  }
+  if (syncFromTracker) {
+    syncSessionIdentityState(state);
+  }
+  return state.sessionIdentityTracker;
 }
 
 function findFirstSubmitBoundaryIndex(text) {
@@ -244,37 +292,79 @@ function processInputChunkForState(state, data) {
 }
 
 function captureDeferredSessionStateBaselineForState(state) {
-  if (!state || typeof state !== "object" || !state.sessionFilePath || state.sessionStateBaselinePendingDiscovery !== true) {
+  const tracker = ensureSessionIdentityTracker(state, { syncFromTracker: false });
+  if (!tracker || !state.sessionFilePath || state.sessionStateBaselinePendingDiscovery !== true) {
     return 0;
   }
   try {
-    state.sessionStateBaselineSize = state.sessionStatePreserveDiscoveredTail === true
-      ? 0
-      : fs.statSync(state.sessionFilePath).size;
-    state.sessionStateBaselinePendingDiscovery = false;
+    if (state.sessionStatePreserveDiscoveredTail === true) {
+      tracker.attachDiscoveredSession({
+        sessionId: state.sessionId || "",
+        sessionFilePath: state.sessionFilePath,
+        preserveDiscoveredTail: true,
+      });
+    } else {
+      tracker.attachResumedSession({
+        sessionId: state.sessionId || "",
+        sessionFilePath: state.sessionFilePath,
+        currentSize: fs.statSync(state.sessionFilePath).size,
+      });
+    }
     state.sessionStatePreserveDiscoveredTail = false;
+    syncSessionIdentityState(state);
     return state.sessionStateBaselineSize;
   } catch (_) {
-    state.sessionStateBaselineSize = 0;
+    tracker.attachDiscoveredSession({
+      sessionId: state.sessionId || "",
+      sessionFilePath: state.sessionFilePath || "",
+      preserveDiscoveredTail: true,
+    });
     state.sessionStatePreserveDiscoveredTail = false;
+    syncSessionIdentityState(state);
     return 0;
   }
 }
 
 function captureSessionStateBaselineForState(state, options = {}) {
-  if (!state || typeof state !== "object") {
+  const tracker = ensureSessionIdentityTracker(state, { syncFromTracker: false });
+  if (!tracker) {
     return 0;
   }
   const preserveDiscoveredTail = options && options.preserveDiscoveredTail === true;
   if (!state.sessionFilePath) {
-    state.sessionStateBaselineSize = 0;
-    state.sessionStateBaselinePendingDiscovery = true;
+    tracker.markAwaitingDiscovery();
+    if (state.sessionId) {
+      state.sessionId = "";
+    }
+    syncSessionIdentityState(state);
     state.sessionStatePreserveDiscoveredTail = preserveDiscoveredTail;
     return 0;
   }
-  state.sessionStateBaselinePendingDiscovery = true;
-  state.sessionStatePreserveDiscoveredTail = preserveDiscoveredTail;
-  return captureDeferredSessionStateBaselineForState(state);
+  if (preserveDiscoveredTail) {
+    tracker.attachDiscoveredSession({
+      sessionId: state.sessionId || "",
+      sessionFilePath: state.sessionFilePath,
+      preserveDiscoveredTail: true,
+    });
+    syncSessionIdentityState(state);
+    state.sessionStatePreserveDiscoveredTail = false;
+    return state.sessionStateBaselineSize;
+  }
+  try {
+    tracker.attachResumedSession({
+      sessionId: state.sessionId || "",
+      sessionFilePath: state.sessionFilePath,
+      currentSize: fs.statSync(state.sessionFilePath).size,
+    });
+    syncSessionIdentityState(state);
+    state.sessionStatePreserveDiscoveredTail = false;
+    return state.sessionStateBaselineSize;
+  } catch (_) {
+    tracker.markAwaitingDiscovery();
+    syncSessionIdentityState(state);
+    state.sessionStatePreserveDiscoveredTail = preserveDiscoveredTail;
+    return 0;
+  }
 }
 
 function readCurrentSessionStateForState(state) {
@@ -450,6 +540,7 @@ async function main({ forwardedArgs }) {
   }
 
   function applyObservedSessionIdentity(sessionIdentity = {}) {
+    const tracker = ensureSessionIdentityTracker(state, { syncFromTracker: false });
     const nextSessionId = typeof sessionIdentity.sessionId === "string" ? sessionIdentity.sessionId : "";
     const nextSessionFilePath = typeof sessionIdentity.sessionFilePath === "string" ? sessionIdentity.sessionFilePath : "";
     const preserveDiscoveredTail = sessionIdentity.preserveDiscoveredTail === true;
@@ -463,6 +554,28 @@ async function main({ forwardedArgs }) {
     }
 
     if (sessionFilePathChanged) {
+      if (tracker) {
+        if (preserveDiscoveredTail) {
+          tracker.attachDiscoveredSession({
+            sessionId: state.sessionId || "",
+            sessionFilePath: nextSessionFilePath,
+            preserveDiscoveredTail: true,
+          });
+        } else {
+          let currentSize = 0;
+          try {
+            currentSize = fs.statSync(nextSessionFilePath).size;
+          } catch (_) {
+            currentSize = 0;
+          }
+          tracker.attachResumedSession({
+            sessionId: state.sessionId || "",
+            sessionFilePath: nextSessionFilePath,
+            currentSize,
+          });
+        }
+        syncSessionIdentityState(state);
+      }
       captureSessionStateBaselineForState(state, { preserveDiscoveredTail });
     }
 
@@ -538,9 +651,9 @@ async function main({ forwardedArgs }) {
     const startedAtMs = Date.now();
     state.launchNonce += 1;
     const currentLaunchNonce = state.launchNonce;
-    state.sessionId = "";
-    state.sessionFilePath = "";
-    state.sessionStateBaselineSize = 0;
+    ensureSessionIdentityTracker(state, { syncFromTracker: false });
+    state.sessionIdentityTracker.markAwaitingDiscovery();
+    syncSessionIdentityState(state);
     state.sessionStateBaselinePendingDiscovery = false;
     state.sessionStatePreserveDiscoveredTail = false;
     state.outputBuffer = "";
