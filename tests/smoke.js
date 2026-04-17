@@ -42,6 +42,11 @@ run("manual", ["manual"], (output) => {
   assert.doesNotMatch(output, /ccx: interactive terminal required/i);
 });
 
+run("resume", ["resume", "sess-1"], (output) => {
+  assert.match(output, /cdx: interactive terminal required/i);
+  assert.doesNotMatch(output, /ccx:/i);
+});
+
 run("manual extra", ["manual", "extra"], (output) => {
   assert.match(output, /usage: cdx manual/i);
   assert.doesNotMatch(output, /ccx:/i);

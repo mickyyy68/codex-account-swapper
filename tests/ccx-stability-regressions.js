@@ -615,6 +615,13 @@ run("strict autoswitch path does not attempt fallback accounts", () => {
   assert.doesNotMatch(source, /shouldAttemptFallbackAccount/);
 });
 
+run("minimal autoswitch path no longer restores prompts after exhaustion", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  assert.doesNotMatch(source, /prefillText:\s*canonicalPrompt/);
+  assert.doesNotMatch(source, /autoSubmitPrefill/);
+});
+
 run("tracker can accept an output-derived session id without losing pending discovery", () => {
   const { createSessionIdentityTracker } = require("../lib/ccx/session-identity");
   const tracker = createSessionIdentityTracker();

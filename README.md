@@ -1,6 +1,6 @@
 # cdx (Codex Account Switcher)
 
-Interactive account switching for Codex CLI.
+Transparent Codex wrapper with conservative autoswitch on real usage exhaustion.
 
 Run:
 
@@ -8,7 +8,15 @@ Run:
 cdx
 ```
 
-`cdx` opens an interactive menu for:
+`cdx` opens the wrapped Codex session.
+
+Use:
+
+```bash
+cdx manual
+```
+
+to open the account manager for:
 - Smart switch
 - Use account
 - Switch account
@@ -34,7 +42,7 @@ bun add -g codex-account-switcher
 Commands installed:
 - `cdx`
 - `cxs` (alias of `cdx`)
-- `ccx` (smart Codex wrapper)
+- `ccx` (legacy alias of `cdx`)
 
 ## Smart Switching
 
@@ -43,7 +51,7 @@ Commands installed:
 Interactive:
 
 ```bash
-cdx
+cdx manual
 ```
 
 then choose `Smart switch`.
@@ -54,28 +62,33 @@ Non-interactive JSON output:
 cdx smart-switch --json
 ```
 
-## ccx
+## Minimal Autoswitch Mode
 
-`ccx` is a lightweight wrapper around the real `codex` CLI.
+`cdx` is intentionally conservative in the interactive path.
 
-Run:
+During autoswitch:
+- exhaustion is detected from structured session state
+- `cdx` stops the current session
+- switches account
+- resumes the exact same `sessionId`
+- verifies that the reopened session is the same one
 
-```bash
-ccx
-```
+`cdx` does not:
+- restore the last prompt
+- autosubmit anything
+- fall back to `fork`
+- guess when session identity is uncertain
 
 Current behavior:
 - launches the real `codex` using your normal `~/.codex`
 - keeps Codex config, skills, sessions, and MCP setup intact
 - on startup, auto-registers the current auth as the first free numeric account if it is not saved yet
 - automatically switches accounts after confirmed usage exhaustion
-- reopens the existing session automatically after usage-exhaustion handling, including resume-only fallback paths when smart-switch cannot produce an OK result
-- restores the last canonical user prompt into the reopened session
-- keeps every usage-exhaustion reopen on a resume-only stabilization pass by explicitly not auto-submitting the restored prompt
+- resumes only the same session after autoswitch, or stops with an error
 
-Current limitations:
-- it is optimized for normal interactive use, not scripted `codex` prompts passed on the CLI
-- after an autoswitch, you still press `Enter` yourself to send the restored prompt
+## ccx
+
+`ccx` still exists as a legacy alias, but `cdx` is the canonical command.
 
 ## Before Setup
 
@@ -104,5 +117,5 @@ It writes a marker file when migration is finalized (for example after import, o
 
 - Interactive terminal required (TTY). Non-interactive runs exit with an error.
 - `cdx smart-switch --json` is the only supported non-interactive subcommand.
-- Legacy subcommands (`cdx use ...`, `cdx save ...`, etc.) are removed.
+- `cdx manual` is the interactive account manager entrypoint.
 - If an email can be detected from an account's auth file, `cdx` shows it in labels (for example, `work <name@company.com>`).
