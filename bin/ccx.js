@@ -22,13 +22,10 @@ const {
   readLatestSessionStateFromSessionFile,
   readLatestSessionStateFromSessionFileAfterSize,
   readLatestUserMessageFromSessionFile,
-  isSessionStateUsageLimitExceeded,
 } = require("../lib/ccx/session-log");
 const {
   sleep,
-  waitForPredicate,
   waitForTruthyValue,
-  waitForUsageLimitSignal,
   waitForChildExit,
 } = require("../lib/ccx/runtime");
 const {
@@ -69,6 +66,9 @@ const {
   formatStartupBanner,
 } = require("../lib/ccx/startup-ui");
 const {
+  createSessionObserver,
+} = require("../lib/ccx/session-observer");
+const {
   ensureCurrentAuthRegistered,
 } = require("../lib/ccx/current-account");
 
@@ -102,16 +102,6 @@ function updateOutputBuffer(buffer, chunk) {
   return next.length > OUTPUT_BUFFER_MAX_CHARS
     ? next.slice(-OUTPUT_BUFFER_MAX_CHARS)
     : next;
-}
-
-function outputLooksLikeUsageLimit(buffer) {
-  const text = String(buffer || "").toLowerCase();
-  return (
-    text.includes("you've hit your usage limit") ||
-    text.includes("you have hit your usage limit") ||
-    (text.includes("usage limit") && text.includes("try again at")) ||
-    (text.includes("purchase more credits") && text.includes("settings/usage"))
-  );
 }
 
 function writeDebugLog(event, fields = {}) {
@@ -172,8 +162,8 @@ function createSupervisor() {
     sessionId: "",
     sessionFilePath: "",
     sessionStateBaselineSize: 0,
+    sessionObserver: null,
     launchNonce: 0,
-    usageLimitWatchNonce: 0,
     shuttingDown: false,
   };
 }
@@ -213,6 +203,10 @@ async function main({ forwardedArgs }) {
       }
       state.ptyProcess = null;
     }
+    if (state.sessionObserver) {
+      state.sessionObserver.stop();
+      state.sessionObserver = null;
+    }
   }
 
   function onResize() {
@@ -229,7 +223,10 @@ async function main({ forwardedArgs }) {
   }
 
   function cancelUsageLimitWatch() {
-    state.usageLimitWatchNonce += 1;
+    if (state.sessionObserver) {
+      state.sessionObserver.stop();
+      state.sessionObserver = null;
+    }
   }
 
   function readCurrentSessionState() {
@@ -287,55 +284,46 @@ async function main({ forwardedArgs }) {
 
   function armUsageLimitWatch(pendingPrompt) {
     cancelUsageLimitWatch();
-    const watchNonce = state.usageLimitWatchNonce;
     writeDebugLog("usage_watch_armed", {
       sessionId: state.sessionId,
       sessionFilePath: state.sessionFilePath,
       pendingPrompt,
     });
 
-    waitForUsageLimitSignal(
-      () => ({
-        sessionState: readCurrentSessionState(),
-        outputFallbackMatched: !state.sessionFilePath && outputLooksLikeUsageLimit(state.outputBuffer),
-      }),
-      {
-        stopWhen: () => (
-          state.switching ||
-          state.shuttingDown ||
-          watchNonce !== state.usageLimitWatchNonce ||
-          state.lastSubmittedPrompt !== pendingPrompt
-        ),
-        isMatch: (snapshot) => {
-          if (!snapshot || typeof snapshot !== "object") {
-            return false;
-          }
-          return snapshot.outputFallbackMatched || isSessionStateUsageLimitExceeded(snapshot.sessionState);
-        },
+    const observer = createSessionObserver({
+      readSessionState: readCurrentSessionState,
+      onUsageLimitExceeded: (event) => {
+        writeDebugLog("usage_watch_completed", {
+          matched: true,
+          cancelled: false,
+          sessionId: state.sessionId,
+          sessionFilePath: state.sessionFilePath,
+          pendingPrompt,
+        });
+        if (state.switching || state.shuttingDown || state.lastSubmittedPrompt !== pendingPrompt) {
+          return;
+        }
+        state.lastSubmittedPrompt = "";
+        writeDebugLog("usage_watch_triggered", {
+          sessionId: state.sessionId,
+          sessionFilePath: state.sessionFilePath,
+          pendingPrompt,
+          canonicalPrompt: event && event.prompt ? event.prompt : "",
+        });
+        observer.stop();
+        if (state.sessionObserver === observer) {
+          state.sessionObserver = null;
+        }
+        Promise.resolve(reopenWithSmartSwitch(event && event.prompt ? event.prompt : pendingPrompt)).catch((err) => {
+          writeDebugLog("usage_watch_error", { message: err.message || String(err) });
+          cleanup();
+          die(err.message || String(err));
+        });
       },
-    ).then((result) => {
-      writeDebugLog("usage_watch_completed", {
-        matched: result.matched,
-        cancelled: result.cancelled,
-        sessionId: state.sessionId,
-        sessionFilePath: state.sessionFilePath,
-        pendingPrompt,
-      });
-      if (!result.matched || state.switching || state.lastSubmittedPrompt !== pendingPrompt) {
-        return;
-      }
-      state.lastSubmittedPrompt = "";
-      writeDebugLog("usage_watch_triggered", {
-        sessionId: state.sessionId,
-        sessionFilePath: state.sessionFilePath,
-        pendingPrompt,
-      });
-      return reopenWithSmartSwitch(pendingPrompt);
-    }).catch((err) => {
-      writeDebugLog("usage_watch_error", { message: err.message || String(err) });
-      cleanup();
-      die(err.message || String(err));
+      intervalMs: 100,
     });
+    state.sessionObserver = observer;
+    observer.start();
   }
 
   async function launchCodex(args, options = {}) {

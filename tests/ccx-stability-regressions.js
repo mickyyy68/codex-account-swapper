@@ -5,14 +5,16 @@ const assert = require("node:assert/strict");
 const { resolvePendingPrompt } = require("../lib/ccx/prompt-state");
 const { createOutputPipeline } = require("../lib/ccx/output-pipeline");
 
+const pendingRuns = [];
+
 function run(name, fn) {
-  try {
-    fn();
+  pendingRuns.push(Promise.resolve().then(fn).then(() => {
     process.stdout.write(`ok - ${name}\n`);
-  } catch (err) {
+  }).catch((err) => {
     process.stderr.write(`not ok - ${name}\n${err.stack || err.message}\n`);
-    process.exit(1);
-  }
+    process.exitCode = 1;
+    throw err;
+  }));
 }
 
 run("approval ui does not become a pending prompt", () => {
@@ -169,4 +171,45 @@ run("generic indented path lines do not get a footer badge", () => {
   assert.doesNotMatch(second, /\u001b\[1;32mCDX\u001b\[0m/);
 });
 
-process.stdout.write("all cdx stability regression tests passed\n");
+run("observer emits exhaustion only from structured session state", async () => {
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
+  let latestState = null;
+  let outputFallbackMatched = true;
+  const events = [];
+
+  const observer = createSessionObserver({
+    readSessionState: () => latestState,
+    onUsageLimitExceeded: (event) => events.push(event),
+    intervalMs: 5,
+  });
+
+  observer.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(events.length, 0);
+
+  outputFallbackMatched = false;
+  latestState = {
+    latestError: {
+      code: "usage_limit_exceeded",
+      message: "You've hit your usage limit.",
+      timestamp: "2026-04-16T12:00:00.000Z",
+    },
+    latestUserMessage: "leggi il progetto",
+  };
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  observer.stop();
+
+  assert.equal(outputFallbackMatched, false);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].prompt, "leggi il progetto");
+  assert.equal(events[0].sessionState.latestUserMessage, "leggi il progetto");
+});
+
+Promise.all(pendingRuns)
+  .then(() => {
+    process.stdout.write("all cdx stability regression tests passed\n");
+  })
+  .catch(() => {
+    process.exit(process.exitCode || 1);
+  });
