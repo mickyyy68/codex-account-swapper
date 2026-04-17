@@ -127,7 +127,7 @@ run("generic indented trailing output does not become a pending prompt", () => {
 });
 
 run("transparent output lane passes normal chunks through immediately", () => {
-  const pipeline = createOutputPipeline({ enableFooterBadge: true });
+  const pipeline = createOutputPipeline();
   assert.equal(pipeline.transform("assistant partial chunk"), "assistant partial chunk");
 });
 
@@ -143,6 +143,17 @@ run("minimal wrapper no longer imports prompt restore helpers in the autoswitch 
 
   assert.doesNotMatch(source, /createPrefillController/);
   assert.doesNotMatch(source, /formatHighlightedUserPrompt/);
+});
+
+run("autoswitch reopen branches call resume without prompt options", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  const reopenCallPattern = /await launchCodex\(\["resume", previousSessionId\]\);/g;
+  const reopenCalls = source.match(reopenCallPattern) || [];
+
+  assert.equal(reopenCalls.length >= 3, true);
+  assert.doesNotMatch(source, /prefillText:/);
+  assert.doesNotMatch(source, /autoSubmitPrefill:/);
 });
 
 run("footer-like lines stay transparent without decoration", () => {
