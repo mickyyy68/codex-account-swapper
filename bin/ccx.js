@@ -40,9 +40,6 @@ const {
   createOutputPipeline,
 } = require("../lib/ccx/output-pipeline");
 const {
-  formatHighlightedUserPrompt,
-} = require("../lib/ccx/output-style");
-const {
   formatSwitchingBanner,
   formatDecisionBanner,
   formatFailureBanner,
@@ -830,12 +827,7 @@ async function main({ forwardedArgs }) {
     try {
       await launchCodex(["resume", previousSessionId], {
         prefillText: canonicalPrompt,
-        autoSubmitPrefill: true,
-        onAutoSubmitted: (submittedPrompt) => {
-          state.draftBuffer = "";
-          state.outputBuffer = "";
-          writeStatusLine(formatHighlightedUserPrompt(submittedPrompt));
-        },
+        autoSubmitPrefill: false,
       });
     } finally {
       releaseSwitchingStateForState(state, ensureSessionObserverRunning);

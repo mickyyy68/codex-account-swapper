@@ -68,14 +68,14 @@ Current behavior:
 - launches the real `codex` using your normal `~/.codex`
 - keeps Codex config, skills, sessions, and MCP setup intact
 - on startup, auto-registers the current auth as the first free numeric account if it is not saved yet
-- on `Enter`, checks the latest session rate limits before forwarding the prompt
-- if the active account is exhausted, runs `cdx smart-switch --json`
-- reopens the conversation with `codex fork <sessionId>`
-- restores the pending prompt in the reopened conversation without sending it automatically
+- automatically switches accounts after confirmed usage exhaustion
+- resumes the existing session automatically after the switch
+- restores the last canonical user prompt into the resumed session
+- does not auto-submit the restored prompt during the stabilization pass
 
 Current limitations:
 - it is optimized for normal interactive use, not scripted `codex` prompts passed on the CLI
-- it does not auto-submit the restored prompt
+- after an autoswitch, you still press `Enter` yourself to send the restored prompt
 
 ## Before Setup
 

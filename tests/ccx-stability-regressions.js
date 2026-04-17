@@ -1052,6 +1052,16 @@ run("post-switch resume releases switching before re-arming the observer", () =>
   assert.equal(shouldArmDuringRelease, true);
 });
 
+run("stabilization autoswitch resumes with restored prompt but without autosubmit", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  assert.match(
+    source,
+    /await launchCodex\(\["resume", previousSessionId\], \{\s*prefillText: canonicalPrompt,/s,
+  );
+  assert.doesNotMatch(source, /autoSubmitPrefill:\s*true/);
+});
+
 Promise.all(pendingRuns)
   .then(() => {
     process.stdout.write("all cdx stability regression tests passed\n");
