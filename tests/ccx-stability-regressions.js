@@ -590,16 +590,91 @@ run("session observer arming depends on session identity not submit-time prompt 
   );
 });
 
-run("usage-limit handling is not gated on a submit-time pending prompt", () => {
+run("usage-limit handling waits until a canonical prompt is recoverable", () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
   const { _internal } = require("../bin/ccx.js");
 
   assert.equal(typeof _internal.shouldHandleUsageLimitEventForState, "function");
+  assert.equal(typeof _internal.resolveUsageLimitPromptForState, "function");
+  assert.equal(typeof _internal.syncObservedSessionStateForState, "function");
+
+  const earlyWindowState = {
+    switching: false,
+    shuttingDown: false,
+    sessionId: "sess-early-window",
+    sessionFilePath: "",
+    lastSubmittedPrompt: "",
+  };
+
+  assert.equal(
+    _internal.resolveUsageLimitPromptForState(earlyWindowState, {
+      prompt: "",
+    }),
+    "",
+  );
+  assert.equal(
+    _internal.shouldHandleUsageLimitEventForState(earlyWindowState, {
+      prompt: "",
+    }),
+    false,
+  );
+
+  assert.equal(
+    _internal.shouldHandleUsageLimitEventForState(earlyWindowState, {
+      prompt: "prompt from observer event",
+    }),
+    true,
+  );
+
+  _internal.syncObservedSessionStateForState(earlyWindowState, {
+    latestUserMessage: "prompt from observer cache",
+  });
+  assert.equal(
+    _internal.shouldHandleUsageLimitEventForState(earlyWindowState, {
+      prompt: "",
+    }),
+    true,
+  );
+
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccx-stability-handle-usage-limit-"));
+  const sessionFile = path.join(tempRoot, "recoverable-session.jsonl");
+  fs.writeFileSync(
+    sessionFile,
+    [
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:00.000Z",
+        type: "session_meta",
+        payload: {
+          id: "sess-file-recovery",
+          timestamp: "2026-04-17T10:00:00.000Z",
+          cwd: "C:\\repo",
+          originator: "codex-tui",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:01.000Z",
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: "prompt recovered from session file",
+        },
+      }),
+      "",
+    ].join("\n"),
+    "utf8",
+  );
 
   assert.equal(
     _internal.shouldHandleUsageLimitEventForState({
       switching: false,
       shuttingDown: false,
+      sessionId: "sess-file-recovery",
+      sessionFilePath: sessionFile,
       lastSubmittedPrompt: "",
+    }, {
+      prompt: "",
     }),
     true,
   );
@@ -607,7 +682,11 @@ run("usage-limit handling is not gated on a submit-time pending prompt", () => {
     _internal.shouldHandleUsageLimitEventForState({
       switching: true,
       shuttingDown: false,
+      sessionId: "sess-file-recovery",
+      sessionFilePath: sessionFile,
       lastSubmittedPrompt: "",
+    }, {
+      prompt: "prompt from observer event",
     }),
     false,
   );
@@ -615,7 +694,11 @@ run("usage-limit handling is not gated on a submit-time pending prompt", () => {
     _internal.shouldHandleUsageLimitEventForState({
       switching: false,
       shuttingDown: true,
+      sessionId: "sess-file-recovery",
+      sessionFilePath: sessionFile,
       lastSubmittedPrompt: "",
+    }, {
+      prompt: "prompt from observer event",
     }),
     false,
   );

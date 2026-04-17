@@ -280,12 +280,17 @@ function shouldArmSessionObserverForState(state) {
   );
 }
 
-function shouldHandleUsageLimitEventForState(state) {
+function shouldHandleUsageLimitEventForState(state, eventOrPrompt = "") {
+  const canonicalPrompt = typeof eventOrPrompt === "string"
+    ? eventOrPrompt
+    : resolveUsageLimitPromptForState(state, eventOrPrompt);
+
   return Boolean(
     state &&
     typeof state === "object" &&
     !state.switching &&
-    !state.shuttingDown
+    !state.shuttingDown &&
+    canonicalPrompt
   );
 }
 
@@ -453,14 +458,17 @@ async function main({ forwardedArgs }) {
           sessionFilePath: state.sessionFilePath,
           pendingPrompt,
         });
-        if (!shouldHandleUsageLimitEventForState(state)) {
+        if (!shouldHandleUsageLimitEventForState(state, pendingPrompt)) {
           return;
         }
         observer.stop();
         if (state.sessionObserver === observer) {
           state.sessionObserver = null;
         }
-        Promise.resolve(handleUsageLimitExceeded(event)).catch((err) => {
+        Promise.resolve(handleUsageLimitExceeded({
+          ...event,
+          prompt: pendingPrompt,
+        })).catch((err) => {
           writeDebugLog("usage_watch_error", { message: err.message || String(err) });
           cleanup();
           die(err.message || String(err));
