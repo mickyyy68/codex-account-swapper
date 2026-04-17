@@ -193,6 +193,37 @@ function syncSessionIdentityState(state) {
   return state;
 }
 
+function getCanonicalSessionIdentityState(state) {
+  if (!state || typeof state !== "object") {
+    return {
+      sessionId: "",
+      sessionFilePath: "",
+      sessionStateBaselineSize: 0,
+      sessionStateBaselinePendingDiscovery: false,
+    };
+  }
+  if (state.sessionIdentityTracker) {
+    return state.sessionIdentityTracker.getState();
+  }
+  return {
+    sessionId: state.sessionId || "",
+    sessionFilePath: state.sessionFilePath || "",
+    sessionStateBaselineSize: Number(state.sessionStateBaselineSize) || 0,
+    sessionStateBaselinePendingDiscovery: state.sessionStateBaselinePendingDiscovery === true,
+  };
+}
+
+function resolveSessionIdentityForState(state) {
+  const identityState = getCanonicalSessionIdentityState(state);
+  if (!identityState.sessionId && !identityState.sessionFilePath) {
+    return null;
+  }
+  return {
+    sessionId: identityState.sessionId || "",
+    sessionFilePath: identityState.sessionFilePath || "",
+  };
+}
+
 function ensureSessionIdentityTracker(state, options = {}) {
   if (!state || typeof state !== "object") {
     return null;
@@ -293,32 +324,31 @@ function processInputChunkForState(state, data) {
 
 function captureDeferredSessionStateBaselineForState(state) {
   const tracker = ensureSessionIdentityTracker(state, { syncFromTracker: false });
-  const identityState = tracker ? tracker.getState() : null;
-  if (!tracker || !state.sessionFilePath || !identityState || identityState.sessionStateBaselinePendingDiscovery !== true) {
+  const identityState = getCanonicalSessionIdentityState(state);
+  const sessionFilePath = identityState.sessionFilePath || state.sessionFilePath || "";
+  if (!tracker || !sessionFilePath || identityState.sessionStateBaselinePendingDiscovery !== true) {
     return 0;
   }
   try {
     if (state.sessionStatePreserveDiscoveredTail === true) {
-      tracker.attachDiscoveredSession({
+      tracker.attachDiscoveredSessionIdentity({
         sessionId: identityState.sessionId || "",
-        sessionFilePath: state.sessionFilePath,
-        preserveDiscoveredTail: true,
+        sessionFilePath,
       });
     } else {
       tracker.attachResumedSession({
         sessionId: identityState.sessionId || "",
-        sessionFilePath: state.sessionFilePath,
-        currentSize: fs.statSync(state.sessionFilePath).size,
+        sessionFilePath,
+        currentSize: fs.statSync(sessionFilePath).size,
       });
     }
     state.sessionStatePreserveDiscoveredTail = false;
     syncSessionIdentityState(state);
     return state.sessionStateBaselineSize;
   } catch (_) {
-    tracker.attachDiscoveredSession({
+    tracker.attachDiscoveredSessionIdentity({
       sessionId: identityState.sessionId || "",
-      sessionFilePath: state.sessionFilePath || "",
-      preserveDiscoveredTail: true,
+      sessionFilePath,
     });
     state.sessionStatePreserveDiscoveredTail = false;
     syncSessionIdentityState(state);
@@ -333,17 +363,17 @@ function captureSessionStateBaselineForState(state, options = {}) {
   }
   const identityState = tracker.getState();
   const preserveDiscoveredTail = options && options.preserveDiscoveredTail === true;
-  if (!state.sessionFilePath) {
+  const sessionFilePath = identityState.sessionFilePath || state.sessionFilePath || "";
+  if (!sessionFilePath) {
     tracker.markAwaitingDiscovery();
     syncSessionIdentityState(state);
     state.sessionStatePreserveDiscoveredTail = preserveDiscoveredTail;
     return 0;
   }
   if (preserveDiscoveredTail) {
-    tracker.attachDiscoveredSession({
+    tracker.attachDiscoveredSessionIdentity({
       sessionId: identityState.sessionId || "",
-      sessionFilePath: state.sessionFilePath,
-      preserveDiscoveredTail: true,
+      sessionFilePath,
     });
     syncSessionIdentityState(state);
     state.sessionStatePreserveDiscoveredTail = false;
@@ -352,8 +382,8 @@ function captureSessionStateBaselineForState(state, options = {}) {
   try {
     tracker.attachResumedSession({
       sessionId: identityState.sessionId || "",
-      sessionFilePath: state.sessionFilePath,
-      currentSize: fs.statSync(state.sessionFilePath).size,
+      sessionFilePath,
+      currentSize: fs.statSync(sessionFilePath).size,
     });
     syncSessionIdentityState(state);
     state.sessionStatePreserveDiscoveredTail = false;
@@ -367,7 +397,8 @@ function captureSessionStateBaselineForState(state, options = {}) {
 }
 
 function readCurrentSessionStateForState(state) {
-  if (!state || typeof state !== "object" || !state.sessionFilePath) {
+  const identityState = getCanonicalSessionIdentityState(state);
+  if (!state || typeof state !== "object" || !identityState.sessionFilePath) {
     return null;
   }
 
@@ -375,7 +406,7 @@ function readCurrentSessionStateForState(state) {
 
   try {
     return readLatestSessionStateFromSessionFileAfterSize(
-      state.sessionFilePath,
+      identityState.sessionFilePath,
       state.sessionStateBaselineSize,
     );
   } catch (_) {
@@ -409,13 +440,56 @@ function syncObservedSessionStateForState(state, sessionState) {
 }
 
 function shouldArmSessionObserverForState(state) {
+  const sessionIdentity = resolveSessionIdentityForState(state);
   return Boolean(
     state &&
     typeof state === "object" &&
     !state.switching &&
     !state.shuttingDown &&
-    (state.sessionId || state.sessionFilePath)
+    sessionIdentity
   );
+}
+
+function applyObservedSessionIdentityForState(state, sessionIdentity = {}) {
+  const tracker = ensureSessionIdentityTracker(state, { syncFromTracker: false });
+  const currentIdentity = getCanonicalSessionIdentityState(state);
+  const nextSessionId = typeof sessionIdentity.sessionId === "string" ? sessionIdentity.sessionId : "";
+  const nextSessionFilePath = typeof sessionIdentity.sessionFilePath === "string" ? sessionIdentity.sessionFilePath : "";
+  const preserveDiscoveredTail = sessionIdentity.preserveDiscoveredTail === true;
+  const resolvedSessionFilePath = nextSessionFilePath || currentIdentity.sessionFilePath || "";
+  const sessionFilePathChanged = !!resolvedSessionFilePath && resolvedSessionFilePath !== currentIdentity.sessionFilePath;
+
+  if (tracker && nextSessionId && !sessionFilePathChanged) {
+    tracker.setSessionId(nextSessionId);
+  }
+  if (tracker && nextSessionFilePath && !sessionFilePathChanged && nextSessionFilePath !== currentIdentity.sessionFilePath) {
+    tracker.setSessionFilePath(nextSessionFilePath);
+  }
+  if (tracker && sessionFilePathChanged) {
+    if (preserveDiscoveredTail) {
+      tracker.attachDiscoveredSessionIdentity({
+        sessionId: nextSessionId || currentIdentity.sessionId || "",
+        sessionFilePath: resolvedSessionFilePath,
+      });
+    } else {
+      let currentSize = currentIdentity.sessionStateBaselineSize || 0;
+      try {
+        currentSize = fs.statSync(resolvedSessionFilePath).size;
+      } catch (_) {
+        currentSize = currentIdentity.sessionStateBaselineSize || 0;
+      }
+      tracker.attachResumedSession({
+        sessionId: nextSessionId || currentIdentity.sessionId || "",
+        sessionFilePath: resolvedSessionFilePath,
+        currentSize,
+      });
+    }
+  }
+  syncSessionIdentityState(state);
+  if (sessionFilePathChanged) {
+    captureSessionStateBaselineForState(state, { preserveDiscoveredTail });
+  }
+  return resolveSessionIdentityForState(state);
 }
 
 function shouldHandleUsageLimitEventForState(state, eventOrPrompt = "") {
@@ -527,7 +601,7 @@ async function main({ forwardedArgs }) {
 
   function updateSessionIdentityFromOutput() {
     const tracker = ensureSessionIdentityTracker(state, { syncFromTracker: false });
-    const identityState = tracker ? tracker.getState() : null;
+    const identityState = getCanonicalSessionIdentityState(state);
     if (identityState && identityState.sessionId) {
       return;
     }
@@ -546,45 +620,7 @@ async function main({ forwardedArgs }) {
   }
 
   function applyObservedSessionIdentity(sessionIdentity = {}) {
-    const tracker = ensureSessionIdentityTracker(state, { syncFromTracker: false });
-    const nextSessionId = typeof sessionIdentity.sessionId === "string" ? sessionIdentity.sessionId : "";
-    const nextSessionFilePath = typeof sessionIdentity.sessionFilePath === "string" ? sessionIdentity.sessionFilePath : "";
-    const preserveDiscoveredTail = sessionIdentity.preserveDiscoveredTail === true;
-    const sessionFilePathChanged = !!nextSessionFilePath && nextSessionFilePath !== state.sessionFilePath;
-
-    if (nextSessionId) {
-      state.sessionId = nextSessionId;
-    }
-    if (nextSessionFilePath) {
-      state.sessionFilePath = nextSessionFilePath;
-    }
-
-    if (sessionFilePathChanged) {
-      if (tracker) {
-        if (preserveDiscoveredTail) {
-          tracker.attachDiscoveredSession({
-            sessionId: state.sessionId || "",
-            sessionFilePath: nextSessionFilePath,
-            preserveDiscoveredTail: true,
-          });
-        } else {
-          let currentSize = 0;
-          try {
-            currentSize = fs.statSync(nextSessionFilePath).size;
-          } catch (_) {
-            currentSize = 0;
-          }
-          tracker.attachResumedSession({
-            sessionId: state.sessionId || "",
-            sessionFilePath: nextSessionFilePath,
-            currentSize,
-          });
-        }
-        syncSessionIdentityState(state);
-      }
-      captureSessionStateBaselineForState(state, { preserveDiscoveredTail });
-    }
-
+    applyObservedSessionIdentityForState(state, sessionIdentity);
     ensureSessionObserverRunning();
   }
 
@@ -743,16 +779,13 @@ async function main({ forwardedArgs }) {
     state.switching = true;
     cancelUsageLimitWatch();
 
-    const sessionIdentity = state.sessionId
-      ? { sessionId: state.sessionId, sessionFilePath: state.sessionFilePath }
-      : await waitForTruthyValue(
-        () => (
-          (updateSessionIdentityFromOutput(), state.sessionId)
-            ? { sessionId: state.sessionId, sessionFilePath: state.sessionFilePath }
-            : null
-        ),
-        { timeoutMs: SESSION_ID_WAIT_TIMEOUT_MS, intervalMs: 100 },
-      );
+    const sessionIdentity = resolveSessionIdentityForState(state) || await waitForTruthyValue(
+      () => {
+        updateSessionIdentityFromOutput();
+        return resolveSessionIdentityForState(state);
+      },
+      { timeoutMs: SESSION_ID_WAIT_TIMEOUT_MS, intervalMs: 100 },
+    );
 
     if (!sessionIdentity) {
       releaseSwitchingStateForState(state, ensureSessionObserverRunning);
@@ -934,8 +967,10 @@ module.exports = {
     processInputChunkForState,
     captureSessionStateBaselineForState,
     captureDeferredSessionStateBaselineForState,
+    applyObservedSessionIdentityForState,
     readCurrentSessionStateForState,
     readOutputUsageLimitBridgeForState,
+    resolveSessionIdentityForState,
     syncObservedSessionStateForState,
     shouldArmSessionObserverForState,
     shouldHandleUsageLimitEventForState,

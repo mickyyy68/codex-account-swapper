@@ -716,6 +716,86 @@ run("deferred baseline capture keys off tracker pending discovery instead of sta
   assert.equal(state.sessionStateBaselinePendingDiscovery, false);
 });
 
+run("observer arming uses canonical tracker identity instead of stale wrapper mirrors", () => {
+  const { createSessionIdentityTracker } = require("../lib/ccx/session-identity");
+  const { _internal } = require("../bin/ccx.js");
+  const tracker = createSessionIdentityTracker();
+
+  tracker.attachResumedSession({
+    sessionId: "sess-canonical",
+    sessionFilePath: "C:\\tmp\\canonical.jsonl",
+    currentSize: 128,
+  });
+
+  assert.equal(
+    _internal.shouldArmSessionObserverForState({
+      sessionId: "",
+      sessionFilePath: "",
+      sessionIdentityTracker: tracker,
+      switching: false,
+      shuttingDown: false,
+      lastSubmittedPrompt: "",
+    }),
+    true,
+  );
+});
+
+run("identity resolution prefers the canonical tracker over stale wrapper mirrors", () => {
+  const { createSessionIdentityTracker } = require("../lib/ccx/session-identity");
+  const { _internal } = require("../bin/ccx.js");
+  const tracker = createSessionIdentityTracker();
+
+  tracker.attachResumedSession({
+    sessionId: "sess-canonical",
+    sessionFilePath: "C:\\tmp\\canonical.jsonl",
+    currentSize: 128,
+  });
+
+  assert.deepEqual(
+    _internal.resolveSessionIdentityForState({
+      sessionId: "sess-stale",
+      sessionFilePath: "C:\\tmp\\stale.jsonl",
+      sessionIdentityTracker: tracker,
+    }),
+    {
+      sessionId: "sess-canonical",
+      sessionFilePath: "C:\\tmp\\canonical.jsonl",
+    },
+  );
+});
+
+run("sessionId-only corrections update the canonical tracker for an already-known path", () => {
+  const { createSessionIdentityTracker } = require("../lib/ccx/session-identity");
+  const { _internal } = require("../bin/ccx.js");
+  const tracker = createSessionIdentityTracker();
+
+  tracker.attachResumedSession({
+    sessionId: "sess-original",
+    sessionFilePath: "C:\\tmp\\known.jsonl",
+    currentSize: 128,
+  });
+
+  const state = {
+    sessionId: "sess-stale-wrapper",
+    sessionFilePath: "C:\\tmp\\known.jsonl",
+    sessionStateBaselineSize: 128,
+    sessionStateBaselinePendingDiscovery: false,
+    sessionIdentityTracker: tracker,
+  };
+
+  _internal.applyObservedSessionIdentityForState(state, {
+    sessionId: "sess-corrected",
+    sessionFilePath: "C:\\tmp\\known.jsonl",
+  });
+
+  assert.deepEqual(_internal.resolveSessionIdentityForState(state), {
+    sessionId: "sess-corrected",
+    sessionFilePath: "C:\\tmp\\known.jsonl",
+  });
+  assert.equal(state.sessionId, "sess-corrected");
+  assert.equal(state.sessionFilePath, "C:\\tmp\\known.jsonl");
+});
+
 run("input submit clears stale canonical prompt cache without submit-time watcher mutations", () => {
   const { _internal } = require("../bin/ccx.js");
 
