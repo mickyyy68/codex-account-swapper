@@ -709,6 +709,48 @@ run("empty Enter with approval-style output does not become a prompt submit at t
   assert.equal(state.lastSubmittedPrompt, "observer-owned prompt");
 });
 
+run("coalesced submit chunk preserves only the pre-submit prompt and keeps trailing draft bytes", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.processInputChunkForState, "function");
+
+  const state = {
+    draftBuffer: "",
+    lastSubmittedPrompt: "stale observer prompt",
+    outputBuffer: "stale output",
+    outputTransformer: null,
+  };
+
+  const result = _internal.processInputChunkForState(state, "hello\rworld");
+
+  assert.equal(result.submittedPrompt, "hello");
+  assert.deepEqual(result.forwardingChunks, ["hello\rworld"]);
+  assert.equal(state.draftBuffer, "world");
+  assert.equal(state.outputBuffer, "");
+  assert.equal(state.lastSubmittedPrompt, "");
+});
+
+run("leading submit chunk keeps trailing draft bytes without inventing a submitted prompt", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.processInputChunkForState, "function");
+
+  const state = {
+    draftBuffer: "",
+    lastSubmittedPrompt: "observer-owned prompt",
+    outputBuffer: "approval-style output",
+    outputTransformer: null,
+  };
+
+  const result = _internal.processInputChunkForState(state, "\rworld");
+
+  assert.equal(result.submittedPrompt, "");
+  assert.deepEqual(result.forwardingChunks, ["\rworld"]);
+  assert.equal(state.draftBuffer, "world");
+  assert.equal(state.outputBuffer, "approval-style output");
+  assert.equal(state.lastSubmittedPrompt, "observer-owned prompt");
+});
+
 run("observer-owned prompt sync updates the canonical prompt cache", () => {
   const { _internal } = require("../bin/ccx.js");
 

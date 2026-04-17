@@ -182,15 +182,35 @@ function createSupervisor() {
   };
 }
 
+function findFirstSubmitBoundaryIndex(text) {
+  for (let index = 1; index <= text.length; index += 1) {
+    if (applyInputChunk("", text.slice(0, index)).submitted) {
+      return index;
+    }
+  }
+  return -1;
+}
+
 function processInputChunkForState(state, data) {
   const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
   const escapeRequested = chunkRequestsEscape(text);
-  const inputState = applyInputChunk(state.draftBuffer, text);
-  const submittedPrompt = inputState.submitted && hasDraftText(inputState.draft)
-    ? String(inputState.draft || "")
+  const firstSubmitBoundaryIndex = findFirstSubmitBoundaryIndex(text);
+  const submittedChunk = firstSubmitBoundaryIndex >= 0 ? text.slice(0, firstSubmitBoundaryIndex) : text;
+  const trailingChunk = firstSubmitBoundaryIndex >= 0 ? text.slice(firstSubmitBoundaryIndex) : "";
+  const submittedState = applyInputChunk(state.draftBuffer, submittedChunk);
+  const trailingState = trailingChunk ? applyInputChunk("", trailingChunk) : null;
+  const submittedPrompt = submittedState.submitted && hasDraftText(submittedState.draft)
+    ? String(submittedState.draft || "")
     : "";
 
-  state.draftBuffer = (escapeRequested || inputState.submitted) ? "" : inputState.draft;
+  if (escapeRequested) {
+    state.draftBuffer = "";
+  } else if (submittedState.submitted) {
+    state.draftBuffer = trailingState ? trailingState.draft : "";
+  } else {
+    state.draftBuffer = submittedState.draft;
+  }
+
   if (escapeRequested && state.outputTransformer && typeof state.outputTransformer.reset === "function") {
     state.outputTransformer.reset();
     state.outputBuffer = "";
