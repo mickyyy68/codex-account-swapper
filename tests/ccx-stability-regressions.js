@@ -174,7 +174,6 @@ run("generic indented path lines do not get a footer badge", () => {
 run("observer emits exhaustion only from structured session state", async () => {
   const { createSessionObserver } = require("../lib/ccx/session-observer");
   let latestState = null;
-  let outputFallbackMatched = true;
   const events = [];
 
   const observer = createSessionObserver({
@@ -187,7 +186,6 @@ run("observer emits exhaustion only from structured session state", async () => 
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(events.length, 0);
 
-  outputFallbackMatched = false;
   latestState = {
     latestError: {
       code: "usage_limit_exceeded",
@@ -200,7 +198,6 @@ run("observer emits exhaustion only from structured session state", async () => 
   await new Promise((resolve) => setTimeout(resolve, 20));
   observer.stop();
 
-  assert.equal(outputFallbackMatched, false);
   assert.equal(events.length, 1);
   assert.equal(events[0].prompt, "leggi il progetto");
   assert.equal(events[0].sessionState.latestUserMessage, "leggi il progetto");
@@ -235,39 +232,59 @@ run("observer emits exhaustion from message-text-only usage-limit state", async 
   assert.equal(events[0].sessionState.latestError.message, "You have hit your usage limit.");
 });
 
-run("observer bridges output usage-limit detection only before structured session state exists", async () => {
+run("observer keeps the output bridge active until structured session state is readable", async () => {
   const { createSessionObserver } = require("../lib/ccx/session-observer");
-  let latestState = null;
-  let outputBridgeMatched = true;
+  const structuredStates = [
+    null,
+    null,
+    null,
+    {
+      latestError: null,
+      latestUserMessage: "stato strutturato",
+      rateLimits: null,
+    },
+  ];
+  let readCount = 0;
+  let bridgeCalls = 0;
+  const structuredSignalArgs = [];
   const events = [];
 
   const observer = createSessionObserver({
-    readSessionState: () => latestState,
-    hasStructuredSessionSignal: () => !!latestState,
-    readOutputUsageLimitBridge: () => (
-      outputBridgeMatched
-        ? { prompt: "ponte output", source: "output" }
-        : null
-    ),
+    readSessionState: () => structuredStates[Math.min(readCount++, structuredStates.length - 1)],
+    hasStructuredSessionSignal: (sessionState) => {
+      structuredSignalArgs.push(sessionState);
+      return !!sessionState;
+    },
+    readOutputUsageLimitBridge: () => {
+      bridgeCalls += 1;
+      return bridgeCalls === 2
+        ? {
+            prompt: "ponte output",
+            source: "output",
+            message: "You've hit your usage limit.",
+          }
+        : null;
+    },
     onUsageLimitExceeded: (event) => events.push(event),
     intervalMs: 5,
   });
 
   observer.start();
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  const deadline = Date.now() + 100;
+  while (
+    Date.now() < deadline &&
+    (!bridgeCalls || !structuredSignalArgs.some((state) => state && state.latestUserMessage === "stato strutturato"))
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  observer.stop();
+
+  assert.equal(bridgeCalls >= 2, true);
   assert.equal(events.length, 1);
   assert.equal(events[0].prompt, "ponte output");
   assert.equal(events[0].source, "output");
-
-  latestState = {
-    latestUserMessage: "stato strutturato",
-  };
-  outputBridgeMatched = true;
-
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  observer.stop();
-
-  assert.equal(events.length, 1);
+  assert.deepEqual(structuredSignalArgs.slice(0, 3), [null, null, null]);
+  assert.equal(structuredSignalArgs.some((state) => state && state.latestUserMessage === "stato strutturato"), true);
 });
 
 run("pre-session output bridge matches historical usage-limit phrasings", () => {

@@ -302,7 +302,7 @@ async function main({ forwardedArgs }) {
 
     const observer = createSessionObserver({
       readSessionState: readCurrentSessionState,
-      hasStructuredSessionSignal: () => !!state.sessionFilePath,
+      hasStructuredSessionSignal: (sessionState) => !!sessionState,
       readOutputUsageLimitBridge: () => {
         if (state.sessionFilePath || !hasOutputUsageLimitMessage(state.outputBuffer)) {
           return null;
