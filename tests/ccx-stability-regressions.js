@@ -622,6 +622,25 @@ run("minimal autoswitch path no longer restores prompts after exhaustion", () =>
   assert.doesNotMatch(source, /autoSubmitPrefill/);
 });
 
+run("strict resume verification does not preload the resumed session id", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  const resumeBranchStart = source.indexOf('if (Array.isArray(args) && args[0] === "resume"');
+  const resumeBranchEnd = source.indexOf("discoverSessionFile(", resumeBranchStart);
+  const resumeBranch = source.slice(resumeBranchStart, resumeBranchEnd);
+
+  assert.notEqual(resumeBranchStart, -1);
+  assert.notEqual(resumeBranchEnd, -1);
+  assert.doesNotMatch(resumeBranch, /sessionId:\s*resumedSession\.id/);
+  assert.match(resumeBranch, /sessionFilePath:\s*resumedSession\.filePath/);
+});
+
+run("strict autoswitch clears transient draft state before resuming", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  assert.match(source, /state\.draftBuffer\s*=\s*"";/);
+});
+
 run("tracker can accept an output-derived session id without losing pending discovery", () => {
   const { createSessionIdentityTracker } = require("../lib/ccx/session-identity");
   const tracker = createSessionIdentityTracker();

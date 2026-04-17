@@ -161,6 +161,9 @@ function createSupervisor() {
     sessionStateBaselineSize: identityState.sessionStateBaselineSize,
     sessionStateBaselinePendingDiscovery: identityState.sessionStateBaselinePendingDiscovery,
     sessionStatePreserveDiscoveredTail: false,
+    resumeVerificationExpectedSessionId: "",
+    resumeVerificationConfirmedSessionId: "",
+    resumeVerificationOutputSeen: false,
     sessionIdentityTracker: identityTracker,
     sessionObserver: null,
     launchNonce: 0,
@@ -209,6 +212,16 @@ function resolveSessionIdentityForState(state) {
     sessionId: identityState.sessionId || "",
     sessionFilePath: identityState.sessionFilePath || "",
   };
+}
+
+function resetResumeVerificationState(state) {
+  if (!state || typeof state !== "object") {
+    return;
+  }
+
+  state.resumeVerificationExpectedSessionId = "";
+  state.resumeVerificationConfirmedSessionId = "";
+  state.resumeVerificationOutputSeen = false;
 }
 
 function ensureSessionIdentityTracker(state, options = {}) {
@@ -577,7 +590,11 @@ async function main({ forwardedArgs }) {
   function updateSessionIdentityFromOutput() {
     const tracker = ensureSessionIdentityTracker(state, { syncFromTracker: false });
     const identityState = getCanonicalSessionIdentityState(state);
-    if (identityState && identityState.sessionId) {
+    const awaitingRuntimeResumeConfirmation = Boolean(
+      state.resumeVerificationExpectedSessionId &&
+      !state.resumeVerificationConfirmedSessionId
+    );
+    if (identityState && identityState.sessionId && !awaitingRuntimeResumeConfirmation) {
       return;
     }
     const resumeSessionId = extractResumeSessionId(state.outputBuffer);
@@ -589,6 +606,9 @@ async function main({ forwardedArgs }) {
       syncSessionIdentityState(state);
     } else {
       state.sessionId = resumeSessionId;
+    }
+    if (state.resumeVerificationExpectedSessionId) {
+      state.resumeVerificationConfirmedSessionId = resumeSessionId;
     }
     writeDebugLog("session_id_from_output", { sessionId: resumeSessionId });
     ensureSessionObserverRunning();
@@ -666,6 +686,7 @@ async function main({ forwardedArgs }) {
     const startedAtMs = Date.now();
     state.launchNonce += 1;
     const currentLaunchNonce = state.launchNonce;
+    resetResumeVerificationState(state);
     ensureSessionIdentityTracker(state, { syncFromTracker: false });
     state.sessionIdentityTracker.markAwaitingDiscovery();
     syncSessionIdentityState(state);
@@ -694,6 +715,9 @@ async function main({ forwardedArgs }) {
     child.onData((data) => {
       process.stdout.write(outputTransformer.transform(data));
       state.outputBuffer = updateOutputBuffer(state.outputBuffer, data);
+      if (state.resumeVerificationExpectedSessionId) {
+        state.resumeVerificationOutputSeen = true;
+      }
       updateSessionIdentityFromOutput();
     });
     child.onExit(({ exitCode }) => {
@@ -715,13 +739,13 @@ async function main({ forwardedArgs }) {
 
     const launchToken = { cancelled: false };
     if (Array.isArray(args) && args[0] === "resume" && typeof args[1] === "string" && args[1]) {
+      state.resumeVerificationExpectedSessionId = args[1];
       const resumedSession = findSessionFileById({
         sessionsDir: SESSIONS_DIR,
         sessionId: args[1],
       });
       if (resumedSession) {
         applyObservedSessionIdentity({
-          sessionId: resumedSession.id,
           sessionFilePath: resumedSession.filePath,
         });
       }
@@ -750,6 +774,7 @@ async function main({ forwardedArgs }) {
     }
 
     state.switching = true;
+    state.draftBuffer = "";
     cancelUsageLimitWatch();
 
     const sessionIdentity = resolveSessionIdentityForState(state) || await waitForTruthyValue(
@@ -803,17 +828,22 @@ async function main({ forwardedArgs }) {
         await launchCodex(["resume", resumeSessionId]);
       },
       verifyResumedSession: async (expectedSessionId) => {
-        const resumedIdentity = await waitForTruthyValue(
+        const confirmedSessionId = await waitForTruthyValue(
           () => {
             updateSessionIdentityFromOutput();
-            return resolveSessionIdentityForState(state);
+            if (!state.resumeVerificationOutputSeen) {
+              return null;
+            }
+            if (!state.resumeVerificationConfirmedSessionId) {
+              return null;
+            }
+            return state.resumeVerificationConfirmedSessionId;
           },
           { timeoutMs: SESSION_ID_WAIT_TIMEOUT_MS, intervalMs: 100 },
         );
         return Boolean(
-          resumedIdentity &&
-          resumedIdentity.sessionId &&
-          resumedIdentity.sessionId === expectedSessionId
+          confirmedSessionId &&
+          confirmedSessionId === expectedSessionId
         );
       },
     });
