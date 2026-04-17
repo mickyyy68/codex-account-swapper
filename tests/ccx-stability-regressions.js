@@ -145,6 +145,14 @@ run("footer badge survives a short model-prefix PTY split", () => {
   assert.match(output, /gpt-5\.4 xhigh \u00b7 ~\\repo/);
 });
 
+run("disproven footer prefixes flush without badge", () => {
+  const pipeline = createOutputPipeline({ enableFooterBadge: true });
+  assert.equal(pipeline.transform("  gpt-5.4"), "");
+  const output = pipeline.transform(" totally not a footer\r\n");
+  assert.doesNotMatch(output, /\u001b\[1;32mCDX\u001b\[0m/);
+  assert.match(output, /gpt-5\.4 totally not a footer/);
+});
+
 run("generic indented path lines do not get a footer badge", () => {
   const pipeline = createOutputPipeline({ enableFooterBadge: true });
   const first = pipeline.transform("  2026 build - /tmp foo\r\n");
