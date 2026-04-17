@@ -131,44 +131,48 @@ run("transparent output lane passes normal chunks through immediately", () => {
   assert.equal(pipeline.transform("assistant partial chunk"), "assistant partial chunk");
 });
 
-run("footer badge still appears for real codex footer lines", () => {
-  const pipeline = createOutputPipeline({ enableFooterBadge: true });
-  assert.equal(pipeline.transform("  gpt-5.4 xhigh"), "");
-  const output = pipeline.transform(" \u00b7 ~\\Documents\\repo\r\n");
-  assert.match(output, /\u001b\[1;32mCDX\u001b\[0m/);
-  assert.match(output, /\u00b7 ~\\Documents\\repo/);
+run("live output pipeline is pure pass-through in minimal mode", () => {
+  const pipeline = createOutputPipeline();
+
+  assert.equal(pipeline.transform("partial assistant chunk"), "partial assistant chunk");
+  assert.equal(pipeline.flush(), "");
 });
 
-run("footer badge survives a short model-prefix PTY split", () => {
-  const pipeline = createOutputPipeline({ enableFooterBadge: true });
-  assert.equal(pipeline.transform("  gpt-5.4"), "");
-  const output = pipeline.transform(" xhigh \u00b7 ~\\repo\r\n");
-  assert.match(output, /\u001b\[1;32mCDX\u001b\[0m/);
-  assert.match(output, /gpt-5\.4 xhigh \u00b7 ~\\repo/);
+run("minimal wrapper no longer imports prompt restore helpers in the autoswitch path", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  assert.doesNotMatch(source, /createPrefillController/);
+  assert.doesNotMatch(source, /formatHighlightedUserPrompt/);
 });
 
-run("complete footer tails without a trailing newline stay buffered for the badge", () => {
-  const pipeline = createOutputPipeline({ enableFooterBadge: true });
-  assert.equal(pipeline.transform("  gpt-5.4 xhigh \u00b7 ~\\repo"), "");
-  const output = pipeline.transform("\r\n");
-  assert.match(output, /\u001b\[1;32mCDX\u001b\[0m/);
-  assert.match(output, /gpt-5\.4 xhigh \u00b7 ~\\repo/);
+run("footer-like lines stay transparent without decoration", () => {
+  const pipeline = createOutputPipeline();
+
+  assert.equal(pipeline.transform("  gpt-5.4 xhigh \u00b7 ~\\Documents\\repo\r\n"), "  gpt-5.4 xhigh \u00b7 ~\\Documents\\repo\r\n");
+  assert.equal(pipeline.flush(), "");
 });
 
-run("disproven footer prefixes flush without badge", () => {
-  const pipeline = createOutputPipeline({ enableFooterBadge: true });
-  assert.equal(pipeline.transform("  gpt-5.4"), "");
-  const output = pipeline.transform(" totally not a footer\r\n");
-  assert.doesNotMatch(output, /\u001b\[1;32mCDX\u001b\[0m/);
-  assert.match(output, /gpt-5\.4 totally not a footer/);
+run("split footer-like chunks stay transparent", () => {
+  const pipeline = createOutputPipeline();
+
+  assert.equal(pipeline.transform("  gpt-5.4"), "  gpt-5.4");
+  assert.equal(pipeline.transform(" xhigh \u00b7 ~\\repo\r\n"), " xhigh \u00b7 ~\\repo\r\n");
+  assert.equal(pipeline.flush(), "");
 });
 
-run("generic indented path lines do not get a footer badge", () => {
-  const pipeline = createOutputPipeline({ enableFooterBadge: true });
-  const first = pipeline.transform("  2026 build - /tmp foo\r\n");
-  const second = pipeline.transform("  7 job - C:\\temp file\r\n");
-  assert.doesNotMatch(first, /\u001b\[1;32mCDX\u001b\[0m/);
-  assert.doesNotMatch(second, /\u001b\[1;32mCDX\u001b\[0m/);
+run("footer-like tails do not buffer for decoration", () => {
+  const pipeline = createOutputPipeline();
+
+  assert.equal(pipeline.transform("  gpt-5.4 xhigh \u00b7 ~\\repo"), "  gpt-5.4 xhigh \u00b7 ~\\repo");
+  assert.equal(pipeline.flush(), "");
+});
+
+run("generic indented path lines stay transparent", () => {
+  const pipeline = createOutputPipeline();
+
+  assert.equal(pipeline.transform("  2026 build - /tmp foo\r\n"), "  2026 build - /tmp foo\r\n");
+  assert.equal(pipeline.transform("  7 job - C:\\temp file\r\n"), "  7 job - C:\\temp file\r\n");
+  assert.equal(pipeline.flush(), "");
 });
 
 run("observer emits exhaustion only from structured session state", async () => {

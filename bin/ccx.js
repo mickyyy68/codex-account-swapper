@@ -24,7 +24,6 @@ const {
 } = require("../lib/ccx/fallback");
 const {
   extractResumeSessionId,
-  extractVisiblePromptDraft,
 } = require("../lib/ccx/prompt-state");
 const {
   applyInputChunk,
@@ -33,9 +32,6 @@ const {
   getForwardingChunks,
   hasDraftText,
 } = require("../lib/ccx/input-buffer");
-const {
-  createPrefillController,
-} = require("../lib/ccx/prefill");
 const {
   createOutputPipeline,
 } = require("../lib/ccx/output-pipeline");
@@ -549,9 +545,6 @@ async function main({ forwardedArgs }) {
     state.sessionStatePreserveDiscoveredTail = false;
     state.outputBuffer = "";
     cancelUsageLimitWatch();
-    const prefillText = typeof options.prefillText === "string" ? options.prefillText : "";
-    const autoSubmitPrefill = options.autoSubmitPrefill === true;
-    const onAutoSubmitted = typeof options.onAutoSubmitted === "function" ? options.onAutoSubmitted : null;
     const existingSessionFiles = listSessionFilesRecursive(SESSIONS_DIR);
     writeDebugLog("launch_codex", {
       args,
@@ -569,59 +562,15 @@ async function main({ forwardedArgs }) {
     });
 
     state.ptyProcess = child;
-    const outputTransformer = createOutputPipeline({ enableFooterBadge: true });
+    const outputTransformer = createOutputPipeline();
     state.outputTransformer = outputTransformer;
-    const prefillController = createPrefillController({
-      prefillText,
-      autoSubmit: autoSubmitPrefill,
-    });
-    const canAutoSubmitPrefill = () => {
-      if (!autoSubmitPrefill) {
-        return true;
-      }
-      const visiblePrompt = extractVisiblePromptDraft(state.outputBuffer);
-      return visiblePrompt === prefillText;
-    };
-    let outputPrefillTimer = null;
-    let fallbackPrefillTimer = null;
-    const schedulePrefill = () => {
-      if (!prefillText || outputPrefillTimer) {
-        return;
-      }
-      outputPrefillTimer = setTimeout(() => {
-        outputPrefillTimer = null;
-        prefillController.run(
-          (chunk) => child.write(chunk),
-          () => state.ptyProcess === child,
-          (submittedPrompt) => {
-            writeDebugLog("prefill_autosubmitted", {
-              sessionId: state.sessionId,
-              sessionFilePath: state.sessionFilePath,
-              submittedPrompt,
-            });
-            if (onAutoSubmitted) {
-              onAutoSubmitted(submittedPrompt);
-            }
-          },
-          canAutoSubmitPrefill,
-        );
-      }, 250);
-    };
     child.onData((data) => {
       process.stdout.write(outputTransformer.transform(data));
       state.outputBuffer = updateOutputBuffer(state.outputBuffer, data);
       updateSessionIdentityFromOutput();
-      schedulePrefill();
     });
     child.onExit(({ exitCode }) => {
       const wasSwitching = state.switching;
-      if (outputPrefillTimer) {
-        clearTimeout(outputPrefillTimer);
-      }
-      if (fallbackPrefillTimer) {
-        clearTimeout(fallbackPrefillTimer);
-      }
-      prefillController.clear();
       const flushedOutput = outputTransformer.flush();
       if (flushedOutput) {
         process.stdout.write(flushedOutput);
@@ -636,26 +585,6 @@ async function main({ forwardedArgs }) {
       cleanup();
       process.exit(typeof exitCode === "number" ? exitCode : 0);
     });
-    if (prefillText) {
-      fallbackPrefillTimer = setTimeout(() => {
-        fallbackPrefillTimer = null;
-        prefillController.run(
-          (chunk) => child.write(chunk),
-          () => state.ptyProcess === child,
-          (submittedPrompt) => {
-            writeDebugLog("prefill_autosubmitted", {
-              sessionId: state.sessionId,
-              sessionFilePath: state.sessionFilePath,
-              submittedPrompt,
-            });
-            if (onAutoSubmitted) {
-              onAutoSubmitted(submittedPrompt);
-            }
-          },
-          canAutoSubmitPrefill,
-        );
-      }, 1500);
-    }
 
     const launchToken = { cancelled: false };
     if (Array.isArray(args) && args[0] === "resume" && typeof args[1] === "string" && args[1]) {
