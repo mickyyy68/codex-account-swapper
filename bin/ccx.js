@@ -10,7 +10,7 @@ let pty;
 try {
   pty = require("node-pty");
 } catch (err) {
-  process.stderr.write(`ccx: failed to load node-pty (${err.message}). Run \`npm.cmd install\` in this repo.\n`);
+  process.stderr.write(`cdx: failed to load node-pty (${err.message}). Run \`npm.cmd install\` in this repo.\n`);
   process.exit(1);
 }
 
@@ -52,10 +52,11 @@ const {
   createPrefillController,
 } = require("../lib/ccx/prefill");
 const {
-  highlightUserPromptLines,
-  createUserPromptOutputTransformer,
   formatHighlightedUserPrompt,
 } = require("../lib/ccx/output-style");
+const {
+  createOutputPipeline,
+} = require("../lib/ccx/output-pipeline");
 const {
   formatSwitchingBanner,
   formatDecisionBanner,
@@ -82,13 +83,13 @@ const SESSION_ID_WAIT_TIMEOUT_MS = 30_000;
 const OUTPUT_BUFFER_MAX_CHARS = 16_000;
 
 function die(message) {
-  process.stderr.write(`ccx: ${message}\n`);
+  process.stderr.write(`cdx: ${message}\n`);
   process.exit(1);
 }
 
 function requireTTY() {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    die("interactive terminal required. Run `ccx` in a TTY.");
+    die("interactive terminal required. Run `cdx` in a TTY.");
   }
 }
 
@@ -185,7 +186,7 @@ async function main({ forwardedArgs }) {
     currentAuthPath: TARGET_AUTH,
   });
   if (bootstrap.message) {
-    writeStatusLine(`[ccx] ${bootstrap.message}`);
+    writeStatusLine(`[CDX] ${bootstrap.message}`);
   }
 
   const state = createSupervisor();
@@ -365,7 +366,7 @@ async function main({ forwardedArgs }) {
     });
 
     state.ptyProcess = child;
-    const outputTransformer = createUserPromptOutputTransformer();
+    const outputTransformer = createOutputPipeline({ enableFooterBadge: true });
     state.outputTransformer = outputTransformer;
     const prefillController = createPrefillController({
       prefillText,
@@ -604,7 +605,7 @@ async function main({ forwardedArgs }) {
     await sleep(150);
     if (result.recommendedStatus && result.recommendedStatus.lowCredits) {
       writeStatusLine(
-        `[ccx] Warning: smart switch selected a low-credit account (${result.recommendedStatus.credits ? result.recommendedStatus.credits.balance : "?"}).`,
+        `[CDX] Warning: smart switch selected a low-credit account (${result.recommendedStatus.credits ? result.recommendedStatus.credits.balance : "?"}).`,
       );
     }
 

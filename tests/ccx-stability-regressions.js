@@ -3,7 +3,7 @@
 
 const assert = require("node:assert/strict");
 const { resolvePendingPrompt } = require("../lib/ccx/prompt-state");
-const { createUserPromptOutputTransformer } = require("../lib/ccx/output-style");
+const { createOutputPipeline } = require("../lib/ccx/output-pipeline");
 
 function run(name, fn) {
   try {
@@ -38,7 +38,7 @@ run("visible multiline prompt survives footer lines but not approval ui", () => 
         "header",
         "\u203a leggi il progetto",
         "  su piu righe",
-        "  gpt-5.4 xhigh · ~\\Documents\\repo",
+        "  gpt-5.4 xhigh \u00b7 ~\\Documents\\repo",
       ].join("\n"),
     ),
     "leggi il progetto\n  su piu righe",
@@ -53,7 +53,7 @@ run("visible multiline prompt with footer and approval ui does not become a pend
         "header",
         "\u203a leggi il progetto",
         "  su piu righe",
-        "  gpt-5.4 xhigh · ~\\Documents\\repo",
+        "  gpt-5.4 xhigh \u00b7 ~\\Documents\\repo",
         "",
         "Allow command execution?",
         "  Enter = approve",
@@ -87,7 +87,7 @@ run("visible multiline prompt survives bare-cr footer lines", () => {
         "header",
         "\u203a leggi il progetto",
         "  su piu righe",
-        "  gpt-5.4 xhigh · ~\\Documents\\repo",
+        "  gpt-5.4 xhigh \u00b7 ~\\Documents\\repo",
       ].join("\r"),
     ),
     "leggi il progetto\n  su piu righe",
@@ -124,18 +124,17 @@ run("generic indented trailing output does not become a pending prompt", () => {
   );
 });
 
-run("normal output chunks flush buffered leading whitespace", () => {
-  const transformer = createUserPromptOutputTransformer();
-  assert.equal(transformer.transform("  hello there"), "");
-  assert.equal(transformer.flush(), "  hello there");
+run("transparent output lane passes normal chunks through immediately", () => {
+  const pipeline = createOutputPipeline({ enableFooterBadge: true });
+  assert.equal(pipeline.transform("assistant partial chunk"), "assistant partial chunk");
 });
 
 run("footer badge still appears for real codex footer lines", () => {
-  const transformer = createUserPromptOutputTransformer();
-  assert.equal(transformer.transform("  gpt-5.4 xhigh"), "");
-  const output = transformer.transform(" · ~\\Documents\\repo\r\n");
+  const pipeline = createOutputPipeline({ enableFooterBadge: true });
+  assert.equal(pipeline.transform("  gpt-5.4 xhigh"), "");
+  const output = pipeline.transform(" \u00b7 ~\\Documents\\repo\r\n");
   assert.match(output, /\u001b\[1;32mCDX\u001b\[0m/);
-  assert.match(output, /· ~\\Documents\\repo/);
+  assert.match(output, /\u00b7 ~\\Documents\\repo/);
 });
 
 process.stdout.write("all cdx stability regression tests passed\n");
