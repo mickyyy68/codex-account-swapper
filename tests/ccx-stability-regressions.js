@@ -243,21 +243,37 @@ run("observer keeps the output bridge active until structured session state is r
     {
       latestUserMessage: "stato strutturato",
     },
+    {
+      latestError: {
+        code: "usage_limit_exceeded",
+        message: "You've hit your usage limit.",
+        timestamp: "2026-04-16T12:00:00.000Z",
+      },
+      latestUserMessage: "stato strutturato",
+    },
   ];
   let readCount = 0;
+  let currentSessionState = null;
   let bridgeCalls = 0;
+  const bridgeStates = [];
+  const sessionStateHistory = [];
   const structuredSignalArgs = [];
   const events = [];
 
   const observer = createSessionObserver({
-    readSessionState: () => structuredStates[Math.min(readCount++, structuredStates.length - 1)],
+    readSessionState: () => {
+      currentSessionState = structuredStates[Math.min(readCount++, structuredStates.length - 1)];
+      sessionStateHistory.push(currentSessionState);
+      return currentSessionState;
+    },
     hasStructuredSessionSignal: (sessionState) => {
       structuredSignalArgs.push(sessionState);
       return hasActionableStructuredSessionState(sessionState);
     },
     readOutputUsageLimitBridge: () => {
       bridgeCalls += 1;
-      return bridgeCalls === 2
+      bridgeStates.push(currentSessionState);
+      return bridgeCalls === 3
         ? {
             prompt: "ponte output",
             source: "output",
@@ -273,18 +289,52 @@ run("observer keeps the output bridge active until structured session state is r
   const deadline = Date.now() + 100;
   while (
     Date.now() < deadline &&
-    (!bridgeCalls || !structuredSignalArgs.some((state) => state && state.latestUserMessage === "stato strutturato"))
+    (!structuredSignalArgs.some((state) => state && state.latestError) || bridgeCalls < 3)
   ) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   observer.stop();
 
-  assert.equal(bridgeCalls >= 2, true);
-  assert.equal(events.length, 1);
+  assert.equal(bridgeCalls, 3);
+  assert.equal(events.length >= 1, true);
   assert.equal(events[0].prompt, "ponte output");
   assert.equal(events[0].source, "output");
-  assert.deepEqual(structuredSignalArgs.slice(0, 2), [null, {}]);
-  assert.equal(structuredSignalArgs.some((state) => state && state.latestUserMessage === "stato strutturato"), true);
+  assert.deepEqual(bridgeStates.slice(0, 3), [
+    null,
+    {},
+    {
+      latestUserMessage: "stato strutturato",
+    },
+  ]);
+  assert.deepEqual(sessionStateHistory.slice(0, 4), [
+    null,
+    {},
+    {
+      latestUserMessage: "stato strutturato",
+    },
+    {
+      latestError: {
+        code: "usage_limit_exceeded",
+        message: "You've hit your usage limit.",
+        timestamp: "2026-04-16T12:00:00.000Z",
+      },
+      latestUserMessage: "stato strutturato",
+    },
+  ]);
+  assert.equal(
+    hasActionableStructuredSessionState({
+      latestUserMessage: "stato strutturato",
+    }),
+    false,
+  );
+  assert.equal(
+    hasActionableStructuredSessionState({
+      latestError: {
+        code: "usage_limit_exceeded",
+      },
+    }),
+    true,
+  );
 });
 
 run("pre-session output bridge matches historical usage-limit phrasings", () => {
