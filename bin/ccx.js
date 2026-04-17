@@ -751,6 +751,7 @@ async function main({ forwardedArgs }) {
       try {
         await launchCodex(["resume", previousSessionId], {
           prefillText: canonicalPrompt,
+          autoSubmitPrefill: false,
         });
       } finally {
         releaseSwitchingStateForState(state, ensureSessionObserverRunning);
@@ -802,6 +803,7 @@ async function main({ forwardedArgs }) {
       try {
         await launchCodex(["resume", previousSessionId], {
           prefillText: canonicalPrompt,
+          autoSubmitPrefill: false,
         });
       } finally {
         releaseSwitchingStateForState(state, ensureSessionObserverRunning);

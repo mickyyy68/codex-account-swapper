@@ -69,9 +69,9 @@ Current behavior:
 - keeps Codex config, skills, sessions, and MCP setup intact
 - on startup, auto-registers the current auth as the first free numeric account if it is not saved yet
 - automatically switches accounts after confirmed usage exhaustion
-- resumes the existing session automatically after the switch
-- restores the last canonical user prompt into the resumed session
-- does not auto-submit the restored prompt during the stabilization pass
+- reopens the existing session automatically after usage-exhaustion handling, including resume-only fallback paths when smart-switch cannot produce an OK result
+- restores the last canonical user prompt into the reopened session
+- keeps every usage-exhaustion reopen on a resume-only stabilization pass by explicitly not auto-submitting the restored prompt
 
 Current limitations:
 - it is optimized for normal interactive use, not scripted `codex` prompts passed on the CLI

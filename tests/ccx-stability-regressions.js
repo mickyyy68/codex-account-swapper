@@ -1052,14 +1052,39 @@ run("post-switch resume releases switching before re-arming the observer", () =>
   assert.equal(shouldArmDuringRelease, true);
 });
 
-run("stabilization autoswitch resumes with restored prompt but without autosubmit", () => {
+run("stabilization exhaustion reopen branches keep the resume-only contract explicit", () => {
   const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
 
-  assert.match(
-    source,
-    /await launchCodex\(\["resume", previousSessionId\], \{\s*prefillText: canonicalPrompt,/s,
+  function assertExplicitResumeOnlyContract(branchName, startNeedle, endNeedle) {
+    const startIndex = source.indexOf(startNeedle);
+    assert.notEqual(startIndex, -1, `${branchName} start anchor should exist`);
+
+    const endIndex = source.indexOf(endNeedle, startIndex + startNeedle.length);
+    assert.notEqual(endIndex, -1, `${branchName} end anchor should exist`);
+
+    const branchSource = source.slice(startIndex, endIndex);
+    assert.match(
+      branchSource,
+      /await launchCodex\(\["resume", previousSessionId\], \{\s*prefillText: canonicalPrompt,\s*autoSubmitPrefill: false,\s*\}\);/s,
+      `${branchName} should reopen with explicit autoSubmitPrefill: false`,
+    );
+  }
+
+  assertExplicitResumeOnlyContract(
+    "runtime-error reopen branch",
+    'writeDebugLog("smart_switch_runtime_error"',
+    "if (!result || !result.ok) {",
   );
-  assert.doesNotMatch(source, /autoSubmitPrefill:\s*true/);
+  assertExplicitResumeOnlyContract(
+    "non-ok reopen branch",
+    "if (!result || !result.ok) {\n      writeStatusLine(formatDecisionBanner(result));",
+    "\n\n    writeDebugLog(\"smart_switch_result\", {\n      ok: true,",
+  );
+  assertExplicitResumeOnlyContract(
+    "successful reopen branch",
+    "writeDebugLog(\"smart_switch_result\", {\n      ok: true,",
+    "\n\n  async function onInput(data) {",
+  );
 });
 
 Promise.all(pendingRuns)
