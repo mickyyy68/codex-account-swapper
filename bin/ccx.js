@@ -47,7 +47,6 @@ const {
   formatStartupBanner,
 } = require("../lib/ccx/startup-ui");
 const {
-  hasActionableStructuredSessionState,
   createSessionObserver,
 } = require("../lib/ccx/session-observer");
 const {
@@ -78,16 +77,6 @@ function loadPtyRuntimeModule() {
   } catch (err) {
     die(`failed to load node-pty (${err.message}). Run \`npm.cmd install\` in this repo.`);
   }
-}
-
-function hasOutputUsageLimitMessage(outputBuffer) {
-  const text = stripAnsi(outputBuffer).toLowerCase();
-  return (
-    text.includes("you've hit your usage limit") ||
-    text.includes("you have hit your usage limit") ||
-    (text.includes("usage limit") && text.includes("try again at")) ||
-    (text.includes("purchase more credits") && text.includes("settings/usage"))
-  );
 }
 
 function die(message) {
@@ -414,18 +403,6 @@ function readCurrentSessionStateForState(state) {
   }
 }
 
-function readOutputUsageLimitBridgeForState(state) {
-  if (!state || typeof state !== "object" || !hasOutputUsageLimitMessage(state.outputBuffer)) {
-    return null;
-  }
-
-  return {
-    prompt: state.lastSubmittedPrompt || "",
-    source: "output",
-    message: "You've hit your usage limit.",
-  };
-}
-
 function syncObservedSessionStateForState(state, sessionState) {
   if (!state || typeof state !== "object" || !sessionState || typeof sessionState !== "object") {
     return false;
@@ -633,7 +610,7 @@ async function main({ forwardedArgs }) {
       sessionFilePath: state.sessionFilePath,
       observedPrompt: event && typeof event.prompt === "string" ? event.prompt : "",
       canonicalPrompt,
-      source: event && event.source ? event.source : "session",
+      source: "session",
     });
 
     await reopenWithSmartSwitch(canonicalPrompt);
@@ -652,11 +629,9 @@ async function main({ forwardedArgs }) {
 
     const observer = createSessionObserver({
       readSessionState: readCurrentSessionState,
-      hasStructuredSessionSignal: hasActionableStructuredSessionState,
       onSessionStateObserved: (sessionState) => {
         syncObservedSessionStateForState(state, sessionState);
       },
-      readOutputUsageLimitBridge: () => readOutputUsageLimitBridgeForState(state),
       onUsageLimitExceeded: (event) => {
         syncObservedSessionStateForState(state, event && event.sessionState);
         const pendingPrompt = resolveUsageLimitPromptForState(state, event);
@@ -963,13 +938,11 @@ async function main({ forwardedArgs }) {
 module.exports = {
   _internalMain: main,
   _internal: {
-    hasOutputUsageLimitMessage,
     processInputChunkForState,
     captureSessionStateBaselineForState,
     captureDeferredSessionStateBaselineForState,
     applyObservedSessionIdentityForState,
     readCurrentSessionStateForState,
-    readOutputUsageLimitBridgeForState,
     resolveSessionIdentityForState,
     syncObservedSessionStateForState,
     shouldArmSessionObserverForState,

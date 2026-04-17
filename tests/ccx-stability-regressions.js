@@ -247,11 +247,8 @@ run("observer emits exhaustion from message-text-only usage-limit state", async 
   assert.equal(events[0].sessionState.latestError.message, "You have hit your usage limit.");
 });
 
-run("observer keeps the output bridge active until structured session state is readable", async () => {
-  const {
-    createSessionObserver,
-    hasActionableStructuredSessionState,
-  } = require("../lib/ccx/session-observer");
+run("observer ignores non-exhausted structured session state until a structured exhaustion arrives", async () => {
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
   const structuredStates = [
     null,
     {},
@@ -268,61 +265,26 @@ run("observer keeps the output bridge active until structured session state is r
     },
   ];
   let readCount = 0;
-  let currentSessionState = null;
-  let bridgeCalls = 0;
-  const bridgeStates = [];
-  const sessionStateHistory = [];
-  const structuredSignalArgs = [];
+  const observedStates = [];
   const events = [];
 
   const observer = createSessionObserver({
-    readSessionState: () => {
-      currentSessionState = structuredStates[Math.min(readCount++, structuredStates.length - 1)];
-      sessionStateHistory.push(currentSessionState);
-      return currentSessionState;
-    },
-    hasStructuredSessionSignal: (sessionState) => {
-      structuredSignalArgs.push(sessionState);
-      return hasActionableStructuredSessionState(sessionState);
-    },
-    readOutputUsageLimitBridge: () => {
-      bridgeCalls += 1;
-      bridgeStates.push(currentSessionState);
-      return bridgeCalls === 3
-        ? {
-            prompt: "ponte output",
-            source: "output",
-            message: "You've hit your usage limit.",
-          }
-        : null;
-    },
+    readSessionState: () => structuredStates[Math.min(readCount++, structuredStates.length - 1)],
+    onSessionStateObserved: (sessionState) => observedStates.push(sessionState),
     onUsageLimitExceeded: (event) => events.push(event),
     intervalMs: 5,
   });
 
   observer.start();
   const deadline = Date.now() + 100;
-  while (
-    Date.now() < deadline &&
-    (!structuredSignalArgs.some((state) => state && state.latestError) || bridgeCalls < 3)
-  ) {
+  while (Date.now() < deadline && events.length === 0) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   observer.stop();
 
-  assert.equal(bridgeCalls, 3);
-  assert.equal(events.length >= 1, true);
-  assert.equal(events[0].prompt, "ponte output");
-  assert.equal(events[0].source, "output");
-  assert.deepEqual(bridgeStates.slice(0, 3), [
-    null,
-    {},
-    {
-      latestUserMessage: "stato strutturato",
-    },
-  ]);
-  assert.deepEqual(sessionStateHistory.slice(0, 4), [
-    null,
+  assert.equal(events.length, 1);
+  assert.equal(events[0].prompt, "stato strutturato");
+  assert.deepEqual(observedStates.slice(0, 3), [
     {},
     {
       latestUserMessage: "stato strutturato",
@@ -336,71 +298,13 @@ run("observer keeps the output bridge active until structured session state is r
       latestUserMessage: "stato strutturato",
     },
   ]);
-  assert.equal(
-    hasActionableStructuredSessionState({
-      latestUserMessage: "stato strutturato",
-    }),
-    false,
-  );
-  assert.equal(
-    hasActionableStructuredSessionState({
-      latestError: {
-        code: "usage_limit_exceeded",
-      },
-    }),
-    true,
-  );
 });
 
-run("known session file path does not disable the output bridge before structured state becomes actionable", async () => {
-  const {
-    createSessionObserver,
-    hasActionableStructuredSessionState,
-  } = require("../lib/ccx/session-observer");
-  const { _internal } = require("../bin/ccx.js");
+run("observer does not use rendered output as a core trigger", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
 
-  assert.equal(typeof _internal.readOutputUsageLimitBridgeForState, "function");
-
-  const state = {
-    sessionFilePath: "C:\\Users\\filmd\\.codex\\sessions\\2026\\04\\17\\session.jsonl",
-    outputBuffer: "You've hit your usage limit. Try again later.",
-    lastSubmittedPrompt: "leggi il progetto",
-  };
-  const structuredState = {
-    latestUserMessage: "leggi il progetto",
-  };
-  const events = [];
-
-  const observer = createSessionObserver({
-    readSessionState: () => structuredState,
-    hasStructuredSessionSignal: (sessionState) => hasActionableStructuredSessionState(sessionState),
-    readOutputUsageLimitBridge: () => _internal.readOutputUsageLimitBridgeForState(state),
-    onUsageLimitExceeded: (event) => events.push(event),
-    intervalMs: 5,
-  });
-
-  observer.start();
-  const deadline = Date.now() + 50;
-  while (Date.now() < deadline && events.length === 0) {
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  observer.stop();
-
-  assert.equal(state.sessionFilePath.length > 0, true);
-  assert.equal(hasActionableStructuredSessionState(structuredState), false);
-  assert.equal(events.length, 1);
-  assert.equal(events[0].source, "output");
-  assert.equal(events[0].prompt, "leggi il progetto");
-});
-
-run("pre-session output bridge matches historical usage-limit phrasings", () => {
-  const { _internal } = require("../bin/ccx.js");
-  const hasOutputUsageLimitMessage = _internal && _internal.hasOutputUsageLimitMessage;
-
-  assert.equal(typeof hasOutputUsageLimitMessage, "function");
-  assert.equal(hasOutputUsageLimitMessage("You have hit your usage limit."), true);
-  assert.equal(hasOutputUsageLimitMessage("Please purchase more credits or visit settings/usage."), true);
-  assert.equal(hasOutputUsageLimitMessage("Your usage limit was reached. Please try again at 9:00 PM."), true);
+  assert.doesNotMatch(source, /hasOutputUsageLimitMessage/);
+  assert.doesNotMatch(source, /readOutputUsageLimitBridge/);
 });
 
 run("session state usage-limit detection falls back to historical message text", () => {
@@ -823,32 +727,6 @@ run("input submit clears stale canonical prompt cache without submit-time watche
   assert.deepEqual(state.sessionObserver, { active: true });
 });
 
-run("local submit clears stale prompt cache before the output bridge can replay prompt A", () => {
-  const { _internal } = require("../bin/ccx.js");
-
-  assert.equal(typeof _internal.processInputChunkForState, "function");
-  assert.equal(typeof _internal.readOutputUsageLimitBridgeForState, "function");
-
-  const state = {
-    draftBuffer: "prompt B",
-    lastSubmittedPrompt: "prompt A",
-    outputBuffer: "You've hit your usage limit. Try again later.",
-    outputTransformer: null,
-  };
-
-  const result = _internal.processInputChunkForState(state, "\r");
-  state.outputBuffer = "You've hit your usage limit. Try again later.";
-  const bridgeEvent = _internal.readOutputUsageLimitBridgeForState(state);
-
-  assert.equal(result.submittedPrompt, "prompt B");
-  assert.equal(state.lastSubmittedPrompt, "");
-  assert.deepEqual(bridgeEvent, {
-    prompt: "",
-    source: "output",
-    message: "You've hit your usage limit.",
-  });
-});
-
 run("empty Enter with approval-style output does not become a prompt submit at the wrapper boundary", () => {
   const { _internal } = require("../bin/ccx.js");
 
@@ -1106,26 +984,6 @@ run("usage-limit handling waits until a canonical prompt is recoverable", () => 
     }),
     false,
   );
-});
-
-run("output bridge can reuse the observer-owned prompt cache before structured exhaustion lands", () => {
-  const { _internal } = require("../bin/ccx.js");
-
-  assert.equal(typeof _internal.syncObservedSessionStateForState, "function");
-  assert.equal(typeof _internal.readOutputUsageLimitBridgeForState, "function");
-
-  const state = {
-    outputBuffer: "You've hit your usage limit. Try again later.",
-    lastSubmittedPrompt: "",
-  };
-
-  _internal.syncObservedSessionStateForState(state, {
-    latestUserMessage: "prompt recovered by observer",
-  });
-
-  const event = _internal.readOutputUsageLimitBridgeForState(state);
-  assert.equal(event.prompt, "prompt recovered by observer");
-  assert.equal(event.source, "output");
 });
 
 run("usage-limit prompt resolution prefers the observer event prompt over a stale session tail reread", () => {
