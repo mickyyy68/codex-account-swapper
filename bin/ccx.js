@@ -6,14 +6,6 @@ const os = require("node:os");
 const path = require("node:path");
 const { runCodexWrapper } = require("../lib/cdx/wrapper");
 
-let pty;
-try {
-  pty = require("node-pty");
-} catch (err) {
-  process.stderr.write(`cdx: failed to load node-pty (${err.message}). Run \`npm.cmd install\` in this repo.\n`);
-  process.exit(1);
-}
-
 const cdxInternal = require("./cdx.js")._internal;
 const {
   listSessionFilesRecursive,
@@ -78,6 +70,19 @@ const DISCOVERY_INTERVAL_MS = 250;
 const DISCOVERY_TIMEOUT_MS = 30_000;
 const SESSION_ID_WAIT_TIMEOUT_MS = 30_000;
 const OUTPUT_BUFFER_MAX_CHARS = 16_000;
+let cachedPtyModule = null;
+
+function loadPtyRuntimeModule() {
+  if (cachedPtyModule) {
+    return cachedPtyModule;
+  }
+  try {
+    cachedPtyModule = require("node-pty");
+    return cachedPtyModule;
+  } catch (err) {
+    die(`failed to load node-pty (${err.message}). Run \`npm.cmd install\` in this repo.`);
+  }
+}
 
 function hasOutputUsageLimitMessage(outputBuffer) {
   const text = stripAnsi(outputBuffer).toLowerCase();
@@ -170,6 +175,7 @@ function createSupervisor() {
     sessionFilePath: "",
     sessionStateBaselineSize: 0,
     sessionStateBaselinePendingDiscovery: false,
+    sessionStatePreserveDiscoveredTail: false,
     sessionObserver: null,
     launchNonce: 0,
     shuttingDown: false,
@@ -206,25 +212,32 @@ function captureDeferredSessionStateBaselineForState(state) {
     return 0;
   }
   try {
-    state.sessionStateBaselineSize = fs.statSync(state.sessionFilePath).size;
+    state.sessionStateBaselineSize = state.sessionStatePreserveDiscoveredTail === true
+      ? 0
+      : fs.statSync(state.sessionFilePath).size;
     state.sessionStateBaselinePendingDiscovery = false;
+    state.sessionStatePreserveDiscoveredTail = false;
     return state.sessionStateBaselineSize;
   } catch (_) {
     state.sessionStateBaselineSize = 0;
+    state.sessionStatePreserveDiscoveredTail = false;
     return 0;
   }
 }
 
-function captureSessionStateBaselineForState(state) {
+function captureSessionStateBaselineForState(state, options = {}) {
   if (!state || typeof state !== "object") {
     return 0;
   }
+  const preserveDiscoveredTail = options && options.preserveDiscoveredTail === true;
   if (!state.sessionFilePath) {
     state.sessionStateBaselineSize = 0;
     state.sessionStateBaselinePendingDiscovery = true;
+    state.sessionStatePreserveDiscoveredTail = preserveDiscoveredTail;
     return 0;
   }
   state.sessionStateBaselinePendingDiscovery = true;
+  state.sessionStatePreserveDiscoveredTail = preserveDiscoveredTail;
   return captureDeferredSessionStateBaselineForState(state);
 }
 
@@ -403,6 +416,7 @@ async function main({ forwardedArgs }) {
   function applyObservedSessionIdentity(sessionIdentity = {}) {
     const nextSessionId = typeof sessionIdentity.sessionId === "string" ? sessionIdentity.sessionId : "";
     const nextSessionFilePath = typeof sessionIdentity.sessionFilePath === "string" ? sessionIdentity.sessionFilePath : "";
+    const preserveDiscoveredTail = sessionIdentity.preserveDiscoveredTail === true;
     const sessionFilePathChanged = !!nextSessionFilePath && nextSessionFilePath !== state.sessionFilePath;
 
     if (nextSessionId) {
@@ -413,7 +427,7 @@ async function main({ forwardedArgs }) {
     }
 
     if (sessionFilePathChanged) {
-      captureSessionStateBaselineForState(state);
+      captureSessionStateBaselineForState(state, { preserveDiscoveredTail });
     }
 
     ensureSessionObserverRunning();
@@ -492,6 +506,7 @@ async function main({ forwardedArgs }) {
     state.sessionFilePath = "";
     state.sessionStateBaselineSize = 0;
     state.sessionStateBaselinePendingDiscovery = false;
+    state.sessionStatePreserveDiscoveredTail = false;
     state.outputBuffer = "";
     cancelUsageLimitWatch();
     const prefillText = typeof options.prefillText === "string" ? options.prefillText : "";
@@ -504,6 +519,7 @@ async function main({ forwardedArgs }) {
     });
 
     const spec = cdxInternal.getCodexLaunchSpec(args);
+    const pty = loadPtyRuntimeModule();
     const child = pty.spawn(spec.command, spec.args, {
       cwd: process.cwd(),
       env: { ...process.env },
@@ -622,6 +638,7 @@ async function main({ forwardedArgs }) {
         applyObservedSessionIdentity({
           sessionId: match.id,
           sessionFilePath: match.filePath,
+          preserveDiscoveredTail: true,
         });
       })
       .catch(() => {});
