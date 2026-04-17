@@ -510,7 +510,7 @@ run("delayed session discovery captures the baseline before stale log lines can 
   assert.equal(events[0].sessionState.latestError.code, "usage_limit_exceeded");
 });
 
-run("input submit processing keeps submit-time semantics out of state mutation", () => {
+run("input submit clears stale canonical prompt cache without submit-time watcher mutations", () => {
   const { _internal } = require("../bin/ccx.js");
 
   assert.equal(typeof _internal.processInputChunkForState, "function");
@@ -531,10 +531,65 @@ run("input submit processing keeps submit-time semantics out of state mutation",
   assert.deepEqual(result.forwardingChunks, ["\r"]);
   assert.equal(state.draftBuffer, "");
   assert.equal(state.outputBuffer, "");
-  assert.equal(state.lastSubmittedPrompt, "prompt from observer");
+  assert.equal(state.lastSubmittedPrompt, "");
   assert.equal(state.sessionStateBaselineSize, 321);
   assert.equal(state.sessionStateBaselinePendingDiscovery, true);
   assert.deepEqual(state.sessionObserver, { active: true });
+});
+
+run("local submit clears stale prompt cache before the output bridge can replay prompt A", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.processInputChunkForState, "function");
+  assert.equal(typeof _internal.readOutputUsageLimitBridgeForState, "function");
+
+  const state = {
+    draftBuffer: "prompt B",
+    lastSubmittedPrompt: "prompt A",
+    outputBuffer: "You've hit your usage limit. Try again later.",
+    outputTransformer: null,
+  };
+
+  const result = _internal.processInputChunkForState(state, "\r");
+  state.outputBuffer = "You've hit your usage limit. Try again later.";
+  const bridgeEvent = _internal.readOutputUsageLimitBridgeForState(state);
+
+  assert.equal(result.submittedPrompt, "prompt B");
+  assert.equal(state.lastSubmittedPrompt, "");
+  assert.deepEqual(bridgeEvent, {
+    prompt: "",
+    source: "output",
+    message: "You've hit your usage limit.",
+  });
+});
+
+run("empty Enter with approval-style output does not become a prompt submit at the wrapper boundary", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.processInputChunkForState, "function");
+
+  const state = {
+    draftBuffer: "",
+    lastSubmittedPrompt: "observer-owned prompt",
+    outputBuffer: [
+      "Allow command execution?",
+      "  Enter = approve",
+      "  Esc = deny",
+    ].join("\n"),
+    outputTransformer: null,
+  };
+
+  const result = _internal.processInputChunkForState(state, "\r");
+
+  assert.equal(result.submittedPrompt, "");
+  assert.deepEqual(result.forwardingChunks, ["\r"]);
+  assert.equal(state.draftBuffer, "");
+  assert.equal(state.outputBuffer, [
+    "Allow command execution?",
+    "  Enter = approve",
+    "  Esc = deny",
+  ].join("\n"));
+  assert.equal(state.lastSubmittedPrompt, "observer-owned prompt");
 });
 
 run("observer-owned prompt sync updates the canonical prompt cache", () => {
@@ -676,7 +731,7 @@ run("usage-limit handling waits until a canonical prompt is recoverable", () => 
     }, {
       prompt: "",
     }),
-    true,
+    false,
   );
   assert.equal(
     _internal.shouldHandleUsageLimitEventForState({
@@ -787,8 +842,34 @@ run("usage-limit prompt resolution prefers the observer event prompt over a stal
         prompt: "",
       },
     ),
-    "stale prompt from tail reread",
+    "",
   );
+});
+
+run("post-switch resume releases switching before re-arming the observer", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.releaseSwitchingStateForState, "function");
+  assert.equal(typeof _internal.shouldArmSessionObserverForState, "function");
+
+  const state = {
+    switching: true,
+    shuttingDown: false,
+    sessionId: "sess-rearm",
+    sessionFilePath: "",
+    sessionObserver: null,
+  };
+  let shouldArmDuringRelease = null;
+  let releaseCallbackCalls = 0;
+
+  _internal.releaseSwitchingStateForState(state, () => {
+    releaseCallbackCalls += 1;
+    shouldArmDuringRelease = _internal.shouldArmSessionObserverForState(state);
+  });
+
+  assert.equal(state.switching, false);
+  assert.equal(releaseCallbackCalls, 1);
+  assert.equal(shouldArmDuringRelease, true);
 });
 
 Promise.all(pendingRuns)

@@ -20,7 +20,6 @@ const {
   findMatchingSessionFile,
   findSessionFileById,
   readLatestSessionStateFromSessionFileAfterSize,
-  readLatestUserMessageFromSessionFile,
 } = require("../lib/ccx/session-log");
 const {
   sleep,
@@ -190,6 +189,7 @@ function processInputChunkForState(state, data) {
     state.outputTransformer.reset();
     state.outputBuffer = "";
   } else if (submittedPrompt) {
+    state.lastSubmittedPrompt = "";
     state.outputBuffer = "";
   }
 
@@ -294,6 +294,18 @@ function shouldHandleUsageLimitEventForState(state, eventOrPrompt = "") {
   );
 }
 
+function releaseSwitchingStateForState(state, onReleased = null) {
+  if (!state || typeof state !== "object") {
+    return false;
+  }
+
+  state.switching = false;
+  if (typeof onReleased === "function") {
+    onReleased();
+  }
+  return true;
+}
+
 function resolveUsageLimitPromptForState(state, event) {
   const observedPrompt = event && typeof event.prompt === "string" ? event.prompt : "";
   if (observedPrompt) {
@@ -307,15 +319,7 @@ function resolveUsageLimitPromptForState(state, event) {
     return cachedPrompt;
   }
 
-  if (!state || typeof state !== "object" || !state.sessionFilePath) {
-    return "";
-  }
-
-  try {
-    return readLatestUserMessageFromSessionFile(state.sessionFilePath) || "";
-  } catch (_) {
-    return "";
-  }
+  return "";
 }
 
 async function main({ forwardedArgs }) {
@@ -647,7 +651,7 @@ async function main({ forwardedArgs }) {
       );
 
     if (!sessionIdentity) {
-      state.switching = false;
+      releaseSwitchingStateForState(state, ensureSessionObserverRunning);
       writeDebugLog("smart_switch_skipped_no_session", {});
       writeStatusLine(formatFailureBanner("Session id not available after waiting, skipping smart switch guard."));
       return;
@@ -687,10 +691,13 @@ async function main({ forwardedArgs }) {
         message: err.message || String(err),
       });
       writeStatusLine(formatFailureBanner(`Smart switch failed: ${err.message || String(err)}`));
-      await launchCodex(["resume", previousSessionId], {
-        prefillText: canonicalPrompt,
-      });
-      state.switching = false;
+      try {
+        await launchCodex(["resume", previousSessionId], {
+          prefillText: canonicalPrompt,
+        });
+      } finally {
+        releaseSwitchingStateForState(state, ensureSessionObserverRunning);
+      }
       return;
     }
 
@@ -735,10 +742,13 @@ async function main({ forwardedArgs }) {
 
     if (!result || !result.ok) {
       writeStatusLine(formatDecisionBanner(result));
-      await launchCodex(["resume", previousSessionId], {
-        prefillText: canonicalPrompt,
-      });
-      state.switching = false;
+      try {
+        await launchCodex(["resume", previousSessionId], {
+          prefillText: canonicalPrompt,
+        });
+      } finally {
+        releaseSwitchingStateForState(state, ensureSessionObserverRunning);
+      }
       return;
     }
 
@@ -757,16 +767,19 @@ async function main({ forwardedArgs }) {
     }
 
     state.draftBuffer = "";
-    await launchCodex(["resume", previousSessionId], {
-      prefillText: canonicalPrompt,
-      autoSubmitPrefill: true,
-      onAutoSubmitted: (submittedPrompt) => {
-        state.draftBuffer = "";
-        state.outputBuffer = "";
-        writeStatusLine(formatHighlightedUserPrompt(submittedPrompt));
-      },
-    });
-    state.switching = false;
+    try {
+      await launchCodex(["resume", previousSessionId], {
+        prefillText: canonicalPrompt,
+        autoSubmitPrefill: true,
+        onAutoSubmitted: (submittedPrompt) => {
+          state.draftBuffer = "";
+          state.outputBuffer = "";
+          writeStatusLine(formatHighlightedUserPrompt(submittedPrompt));
+        },
+      });
+    } finally {
+      releaseSwitchingStateForState(state, ensureSessionObserverRunning);
+    }
   }
 
   async function onInput(data) {
@@ -836,6 +849,7 @@ module.exports = {
     syncObservedSessionStateForState,
     shouldArmSessionObserverForState,
     shouldHandleUsageLimitEventForState,
+    releaseSwitchingStateForState,
     resolveUsageLimitPromptForState,
   },
 };
