@@ -177,6 +177,30 @@ function createSupervisor() {
   };
 }
 
+function processInputChunkForState(state, data) {
+  const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
+  const escapeRequested = chunkRequestsEscape(text);
+  const inputState = applyInputChunk(state.draftBuffer, text);
+  const submittedPrompt = inputState.submitted && hasDraftText(inputState.draft)
+    ? String(inputState.draft || "")
+    : "";
+
+  state.draftBuffer = (escapeRequested || inputState.submitted) ? "" : inputState.draft;
+  if (escapeRequested && state.outputTransformer && typeof state.outputTransformer.reset === "function") {
+    state.outputTransformer.reset();
+    state.outputBuffer = "";
+  } else if (submittedPrompt) {
+    state.outputBuffer = "";
+  }
+
+  return {
+    text,
+    escapeRequested,
+    submittedPrompt,
+    forwardingChunks: getForwardingChunks(text),
+  };
+}
+
 function captureDeferredSessionStateBaselineForState(state) {
   if (!state || typeof state !== "object" || !state.sessionFilePath || state.sessionStateBaselinePendingDiscovery !== true) {
     return 0;
@@ -231,6 +255,62 @@ function readOutputUsageLimitBridgeForState(state) {
     source: "output",
     message: "You've hit your usage limit.",
   };
+}
+
+function syncObservedSessionStateForState(state, sessionState) {
+  if (!state || typeof state !== "object" || !sessionState || typeof sessionState !== "object") {
+    return false;
+  }
+
+  if (typeof sessionState.latestUserMessage !== "string" || !sessionState.latestUserMessage) {
+    return false;
+  }
+
+  state.lastSubmittedPrompt = sessionState.latestUserMessage;
+  return true;
+}
+
+function shouldArmSessionObserverForState(state) {
+  return Boolean(
+    state &&
+    typeof state === "object" &&
+    !state.switching &&
+    !state.shuttingDown &&
+    (state.sessionId || state.sessionFilePath)
+  );
+}
+
+function shouldHandleUsageLimitEventForState(state) {
+  return Boolean(
+    state &&
+    typeof state === "object" &&
+    !state.switching &&
+    !state.shuttingDown
+  );
+}
+
+function resolveUsageLimitPromptForState(state, event) {
+  const observedPrompt = event && typeof event.prompt === "string" ? event.prompt : "";
+  if (observedPrompt) {
+    return observedPrompt;
+  }
+
+  const cachedPrompt = state && typeof state.lastSubmittedPrompt === "string"
+    ? state.lastSubmittedPrompt
+    : "";
+  if (cachedPrompt) {
+    return cachedPrompt;
+  }
+
+  if (!state || typeof state !== "object" || !state.sessionFilePath) {
+    return "";
+  }
+
+  try {
+    return readLatestUserMessageFromSessionFile(state.sessionFilePath) || "";
+  } catch (_) {
+    return "";
+  }
 }
 
 async function main({ forwardedArgs }) {
@@ -298,18 +378,6 @@ async function main({ forwardedArgs }) {
     return readCurrentSessionStateForState(state);
   }
 
-  function getCanonicalSubmittedPrompt(fallbackPrompt) {
-    if (!state.sessionFilePath) {
-      return fallbackPrompt;
-    }
-    try {
-      const latestUserMessage = readLatestUserMessageFromSessionFile(state.sessionFilePath);
-      return latestUserMessage || fallbackPrompt;
-    } catch (_) {
-      return fallbackPrompt;
-    }
-  }
-
   function updateSessionIdentityFromOutput() {
     if (state.sessionId) {
       return;
@@ -320,21 +388,36 @@ async function main({ forwardedArgs }) {
     }
     state.sessionId = resumeSessionId;
     writeDebugLog("session_id_from_output", { sessionId: resumeSessionId });
+    ensureSessionObserverRunning();
   }
 
-  function captureSessionStateBaseline() {
-    captureSessionStateBaselineForState(state);
+  function applyObservedSessionIdentity(sessionIdentity = {}) {
+    const nextSessionId = typeof sessionIdentity.sessionId === "string" ? sessionIdentity.sessionId : "";
+    const nextSessionFilePath = typeof sessionIdentity.sessionFilePath === "string" ? sessionIdentity.sessionFilePath : "";
+    const sessionFilePathChanged = !!nextSessionFilePath && nextSessionFilePath !== state.sessionFilePath;
+
+    if (nextSessionId) {
+      state.sessionId = nextSessionId;
+    }
+    if (nextSessionFilePath) {
+      state.sessionFilePath = nextSessionFilePath;
+    }
+
+    if (sessionFilePathChanged) {
+      captureSessionStateBaselineForState(state);
+    }
+
+    ensureSessionObserverRunning();
   }
 
   async function handleUsageLimitExceeded(event) {
-    const observedPrompt = event && typeof event.prompt === "string" ? event.prompt : "";
-    const canonicalPrompt = getCanonicalSubmittedPrompt(observedPrompt || state.lastSubmittedPrompt);
+    const canonicalPrompt = resolveUsageLimitPromptForState(state, event);
 
     state.lastSubmittedPrompt = "";
     writeDebugLog("usage_watch_triggered", {
       sessionId: state.sessionId,
       sessionFilePath: state.sessionFilePath,
-      observedPrompt,
+      observedPrompt: event && typeof event.prompt === "string" ? event.prompt : "",
       canonicalPrompt,
       source: event && event.source ? event.source : "session",
     });
@@ -342,8 +425,11 @@ async function main({ forwardedArgs }) {
     await reopenWithSmartSwitch(canonicalPrompt);
   }
 
-  function armUsageLimitWatch() {
-    cancelUsageLimitWatch();
+  function ensureSessionObserverRunning() {
+    if (!shouldArmSessionObserverForState(state) || state.sessionObserver) {
+      return;
+    }
+
     writeDebugLog("usage_watch_armed", {
       sessionId: state.sessionId,
       sessionFilePath: state.sessionFilePath,
@@ -353,9 +439,13 @@ async function main({ forwardedArgs }) {
     const observer = createSessionObserver({
       readSessionState: readCurrentSessionState,
       hasStructuredSessionSignal: hasActionableStructuredSessionState,
+      onSessionStateObserved: (sessionState) => {
+        syncObservedSessionStateForState(state, sessionState);
+      },
       readOutputUsageLimitBridge: () => readOutputUsageLimitBridgeForState(state),
       onUsageLimitExceeded: (event) => {
-        const pendingPrompt = state.lastSubmittedPrompt;
+        syncObservedSessionStateForState(state, event && event.sessionState);
+        const pendingPrompt = resolveUsageLimitPromptForState(state, event);
         writeDebugLog("usage_watch_completed", {
           matched: true,
           cancelled: false,
@@ -363,7 +453,7 @@ async function main({ forwardedArgs }) {
           sessionFilePath: state.sessionFilePath,
           pendingPrompt,
         });
-        if (state.switching || state.shuttingDown || !pendingPrompt) {
+        if (!shouldHandleUsageLimitEventForState(state)) {
           return;
         }
         observer.stop();
@@ -506,8 +596,10 @@ async function main({ forwardedArgs }) {
         sessionId: args[1],
       });
       if (resumedSession) {
-        state.sessionId = resumedSession.id;
-        state.sessionFilePath = resumedSession.filePath;
+        applyObservedSessionIdentity({
+          sessionId: resumedSession.id,
+          sessionFilePath: resumedSession.filePath,
+        });
       }
     }
     discoverSessionFile(process.cwd(), startedAtMs, launchToken, existingSessionFiles)
@@ -515,9 +607,10 @@ async function main({ forwardedArgs }) {
         if (!match || currentLaunchNonce !== state.launchNonce) {
           return;
         }
-        state.sessionId = match.id;
-        state.sessionFilePath = match.filePath;
-        captureDeferredSessionStateBaselineForState(state);
+        applyObservedSessionIdentity({
+          sessionId: match.id,
+          sessionFilePath: match.filePath,
+        });
       })
       .catch(() => {});
 
@@ -558,7 +651,7 @@ async function main({ forwardedArgs }) {
       pendingPrompt,
     });
 
-    const canonicalPrompt = getCanonicalSubmittedPrompt(pendingPrompt);
+    const canonicalPrompt = resolveUsageLimitPromptForState(state, { prompt: pendingPrompt });
 
     const previousSessionId = sessionIdentity.sessionId;
     if (state.ptyProcess) {
@@ -660,12 +753,9 @@ async function main({ forwardedArgs }) {
       prefillText: canonicalPrompt,
       autoSubmitPrefill: true,
       onAutoSubmitted: (submittedPrompt) => {
-        state.lastSubmittedPrompt = submittedPrompt;
         state.draftBuffer = "";
         state.outputBuffer = "";
-        captureSessionStateBaseline();
         writeStatusLine(formatHighlightedUserPrompt(submittedPrompt));
-        armUsageLimitWatch();
       },
     });
     state.switching = false;
@@ -673,7 +763,6 @@ async function main({ forwardedArgs }) {
 
   async function onInput(data) {
     const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
-    const escapeRequested = chunkRequestsEscape(text);
     if (chunkRequestsAbort(text)) {
       writeDebugLog("interrupt_exit", {
         switching: state.switching,
@@ -691,28 +780,19 @@ async function main({ forwardedArgs }) {
     writeDebugLog("input_chunk", {
       raw: JSON.stringify(text),
     });
-    const inputState = applyInputChunk(state.draftBuffer, text);
-    const submittedPrompt = inputState.submitted && hasDraftText(inputState.draft)
-      ? String(inputState.draft || "")
-      : "";
-    state.draftBuffer = (escapeRequested || inputState.submitted) ? "" : inputState.draft;
-    if (escapeRequested && state.outputTransformer && typeof state.outputTransformer.reset === "function") {
-      state.outputTransformer.reset();
-      state.outputBuffer = "";
-    }
+    const {
+      submittedPrompt,
+      forwardingChunks,
+    } = processInputChunkForState(state, data);
 
     if (submittedPrompt) {
-      state.lastSubmittedPrompt = submittedPrompt;
-      state.outputBuffer = "";
-      captureSessionStateBaseline();
       writeDebugLog("input_submit", {
         pendingPrompt: submittedPrompt,
         draftBuffer: submittedPrompt,
       });
-      armUsageLimitWatch();
     }
 
-    for (const chunk of getForwardingChunks(text)) {
+    for (const chunk of forwardingChunks) {
       state.ptyProcess.write(chunk);
     }
   }
@@ -740,10 +820,15 @@ module.exports = {
   _internalMain: main,
   _internal: {
     hasOutputUsageLimitMessage,
+    processInputChunkForState,
     captureSessionStateBaselineForState,
     captureDeferredSessionStateBaselineForState,
     readCurrentSessionStateForState,
     readOutputUsageLimitBridgeForState,
+    syncObservedSessionStateForState,
+    shouldArmSessionObserverForState,
+    shouldHandleUsageLimitEventForState,
+    resolveUsageLimitPromptForState,
   },
 };
 

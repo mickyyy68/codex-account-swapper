@@ -510,11 +510,202 @@ run("delayed session discovery captures the baseline before stale log lines can 
   assert.equal(events[0].sessionState.latestError.code, "usage_limit_exceeded");
 });
 
-run("input path no longer depends on visible prompt fallback for submit semantics", () => {
-  const fs = require("node:fs");
-  const source = fs.readFileSync("bin/ccx.js", "utf8");
+run("input submit processing keeps submit-time semantics out of state mutation", () => {
+  const { _internal } = require("../bin/ccx.js");
 
-  assert.doesNotMatch(source, /resolvePendingPrompt\(state\.draftBuffer,\s*state\.outputBuffer\)/);
+  assert.equal(typeof _internal.processInputChunkForState, "function");
+
+  const state = {
+    draftBuffer: "leggi il progetto",
+    lastSubmittedPrompt: "prompt from observer",
+    outputBuffer: "stale output",
+    sessionStateBaselineSize: 321,
+    sessionStateBaselinePendingDiscovery: true,
+    sessionObserver: { active: true },
+    outputTransformer: null,
+  };
+
+  const result = _internal.processInputChunkForState(state, "\r");
+
+  assert.equal(result.submittedPrompt, "leggi il progetto");
+  assert.deepEqual(result.forwardingChunks, ["\r"]);
+  assert.equal(state.draftBuffer, "");
+  assert.equal(state.outputBuffer, "");
+  assert.equal(state.lastSubmittedPrompt, "prompt from observer");
+  assert.equal(state.sessionStateBaselineSize, 321);
+  assert.equal(state.sessionStateBaselinePendingDiscovery, true);
+  assert.deepEqual(state.sessionObserver, { active: true });
+});
+
+run("observer-owned prompt sync updates the canonical prompt cache", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.syncObservedSessionStateForState, "function");
+
+  const state = {
+    lastSubmittedPrompt: "",
+  };
+
+  _internal.syncObservedSessionStateForState(state, {
+    latestUserMessage: "prompt from session state",
+  });
+  assert.equal(state.lastSubmittedPrompt, "prompt from session state");
+
+  _internal.syncObservedSessionStateForState(state, {
+    latestError: {
+      code: "usage_limit_exceeded",
+    },
+  });
+  assert.equal(state.lastSubmittedPrompt, "prompt from session state");
+});
+
+run("session observer arming depends on session identity not submit-time prompt state", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.shouldArmSessionObserverForState, "function");
+
+  assert.equal(
+    _internal.shouldArmSessionObserverForState({
+      sessionId: "sess-1",
+      sessionFilePath: "",
+      lastSubmittedPrompt: "",
+    }),
+    true,
+  );
+  assert.equal(
+    _internal.shouldArmSessionObserverForState({
+      sessionId: "",
+      sessionFilePath: "C:\\Users\\filmd\\.codex\\sessions\\2026\\04\\17\\session.jsonl",
+      lastSubmittedPrompt: "",
+    }),
+    true,
+  );
+  assert.equal(
+    _internal.shouldArmSessionObserverForState({
+      sessionId: "",
+      sessionFilePath: "",
+      lastSubmittedPrompt: "submit-time prompt should not matter",
+    }),
+    false,
+  );
+});
+
+run("usage-limit handling is not gated on a submit-time pending prompt", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.shouldHandleUsageLimitEventForState, "function");
+
+  assert.equal(
+    _internal.shouldHandleUsageLimitEventForState({
+      switching: false,
+      shuttingDown: false,
+      lastSubmittedPrompt: "",
+    }),
+    true,
+  );
+  assert.equal(
+    _internal.shouldHandleUsageLimitEventForState({
+      switching: true,
+      shuttingDown: false,
+      lastSubmittedPrompt: "",
+    }),
+    false,
+  );
+  assert.equal(
+    _internal.shouldHandleUsageLimitEventForState({
+      switching: false,
+      shuttingDown: true,
+      lastSubmittedPrompt: "",
+    }),
+    false,
+  );
+});
+
+run("output bridge can reuse the observer-owned prompt cache before structured exhaustion lands", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.syncObservedSessionStateForState, "function");
+  assert.equal(typeof _internal.readOutputUsageLimitBridgeForState, "function");
+
+  const state = {
+    outputBuffer: "You've hit your usage limit. Try again later.",
+    lastSubmittedPrompt: "",
+  };
+
+  _internal.syncObservedSessionStateForState(state, {
+    latestUserMessage: "prompt recovered by observer",
+  });
+
+  const event = _internal.readOutputUsageLimitBridgeForState(state);
+  assert.equal(event.prompt, "prompt recovered by observer");
+  assert.equal(event.source, "output");
+});
+
+run("usage-limit prompt resolution prefers the observer event prompt over a stale session tail reread", () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.resolveUsageLimitPromptForState, "function");
+
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccx-stability-prompt-resolution-"));
+  const sessionFile = path.join(tempRoot, "stale-session.jsonl");
+  fs.writeFileSync(
+    sessionFile,
+    [
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:00.000Z",
+        type: "session_meta",
+        payload: {
+          id: "sess-stale-prompt",
+          timestamp: "2026-04-17T10:00:00.000Z",
+          cwd: "C:\\repo",
+          originator: "codex-tui",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:01.000Z",
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: "stale prompt from tail reread",
+        },
+      }),
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const state = {
+    sessionFilePath: sessionFile,
+    lastSubmittedPrompt: "prompt from observer cache",
+  };
+
+  assert.equal(
+    _internal.resolveUsageLimitPromptForState(state, {
+      prompt: "fresh prompt from observer event",
+    }),
+    "fresh prompt from observer event",
+  );
+  assert.equal(
+    _internal.resolveUsageLimitPromptForState(state, {
+      prompt: "",
+    }),
+    "prompt from observer cache",
+  );
+  assert.equal(
+    _internal.resolveUsageLimitPromptForState(
+      {
+        sessionFilePath: sessionFile,
+        lastSubmittedPrompt: "",
+      },
+      {
+        prompt: "",
+      },
+    ),
+    "stale prompt from tail reread",
+  );
 });
 
 Promise.all(pendingRuns)
