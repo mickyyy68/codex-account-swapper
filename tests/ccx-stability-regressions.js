@@ -137,4 +137,20 @@ run("footer badge still appears for real codex footer lines", () => {
   assert.match(output, /\u00b7 ~\\Documents\\repo/);
 });
 
+run("footer badge survives a short model-prefix PTY split", () => {
+  const pipeline = createOutputPipeline({ enableFooterBadge: true });
+  assert.equal(pipeline.transform("  gpt-5.4"), "");
+  const output = pipeline.transform(" xhigh \u00b7 ~\\repo\r\n");
+  assert.match(output, /\u001b\[1;32mCDX\u001b\[0m/);
+  assert.match(output, /gpt-5\.4 xhigh \u00b7 ~\\repo/);
+});
+
+run("generic indented path lines do not get a footer badge", () => {
+  const pipeline = createOutputPipeline({ enableFooterBadge: true });
+  const first = pipeline.transform("  2026 build - /tmp foo\r\n");
+  const second = pipeline.transform("  7 job - C:\\temp file\r\n");
+  assert.doesNotMatch(first, /\u001b\[1;32mCDX\u001b\[0m/);
+  assert.doesNotMatch(second, /\u001b\[1;32mCDX\u001b\[0m/);
+});
+
 process.stdout.write("all cdx stability regression tests passed\n");
