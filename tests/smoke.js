@@ -20,6 +20,11 @@ run("default", [], (output) => {
   assert.doesNotMatch(output, /ccx: interactive terminal required/i);
 });
 
+run("wrapper help", ["--help"], (output) => {
+  assert.match(output, /cdx: interactive terminal required/i);
+  assert.doesNotMatch(output, /ccx: interactive terminal required/i);
+});
+
 run("manual", ["manual"], (output) => {
   assert.match(output, /cdx: interactive terminal required/i);
   assert.doesNotMatch(output, /ccx: interactive terminal required/i);
@@ -27,4 +32,5 @@ run("manual", ["manual"], (output) => {
 
 run("manual extra", ["manual", "extra"], (output) => {
   assert.match(output, /usage: cdx manual/i);
+  assert.doesNotMatch(output, /ccx:/i);
 });
