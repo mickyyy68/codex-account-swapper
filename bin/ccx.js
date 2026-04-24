@@ -12,6 +12,7 @@ const {
   findMatchingSessionFile,
   findSessionFileById,
   readLatestSessionStateFromSessionFileAfterSize,
+  hasTuiUsageLimitError,
 } = require("../lib/ccx/session-log");
 const {
   sleep,
@@ -278,6 +279,7 @@ function createSupervisor() {
     launchNonce: 0,
     shuttingDown: false,
     initialAccessModeArgs: [],
+    tuiUsageLimitPatternMatched: false,
   };
 }
 
@@ -763,10 +765,50 @@ async function main({ forwardedArgs }) {
       sessionFilePath: state.sessionFilePath,
       observedPrompt: event && typeof event.prompt === "string" ? event.prompt : "",
       canonicalPrompt,
-      source: "session",
+      source: event && event.source ? event.source : "session",
     });
 
     await reopenWithSmartSwitch();
+  }
+
+  function handleTuiUsageLimitDetection() {
+    if (state.switching === true || state.shuttingDown === true) {
+      return;
+    }
+    const pendingPrompt = resolveUsageLimitPromptForState(state, null);
+    writeDebugLog("tui_usage_limit_detected", {
+      sessionId: state.sessionId,
+      sessionFilePath: state.sessionFilePath,
+      pendingPrompt,
+    });
+    writeDebugLog("usage_watch_completed", {
+      matched: true,
+      cancelled: false,
+      sessionId: state.sessionId,
+      sessionFilePath: state.sessionFilePath,
+      pendingPrompt,
+      source: "tui",
+    });
+    if (!shouldHandleUsageLimitEventForState(state, pendingPrompt)) {
+      writeDebugLog("usage_watch_skipped", {
+        source: "tui",
+        reason: diagnoseUsageLimitSkipReason(state),
+        sessionId: state.sessionId,
+        sessionFilePath: state.sessionFilePath,
+        switching: state.switching === true,
+        shuttingDown: state.shuttingDown === true,
+      });
+      return;
+    }
+    cancelUsageLimitWatch();
+    Promise.resolve(handleUsageLimitExceeded({
+      prompt: pendingPrompt,
+      source: "tui",
+    })).catch((err) => {
+      writeDebugLog("usage_watch_error", { message: err.message || String(err), source: "tui" });
+      cleanup();
+      die(err.message || String(err));
+    });
   }
 
   function ensureSessionObserverRunning() {
@@ -841,6 +883,7 @@ async function main({ forwardedArgs }) {
     syncSessionIdentityState(state);
     state.sessionStatePreserveDiscoveredTail = false;
     state.outputBuffer = "";
+    state.tuiUsageLimitPatternMatched = false;
     cancelUsageLimitWatch();
     const existingSessionFiles = listSessionFilesRecursive(SESSIONS_DIR);
     writeDebugLog("launch_codex", {
@@ -871,6 +914,10 @@ async function main({ forwardedArgs }) {
         state.resumeVerificationOutputSeen = true;
       }
       updateSessionIdentityFromOutput();
+      if (!state.tuiUsageLimitPatternMatched && hasTuiUsageLimitError(state.outputBuffer)) {
+        state.tuiUsageLimitPatternMatched = true;
+        handleTuiUsageLimitDetection();
+      }
     });
     child.onExit(({ exitCode }) => {
       const wasSwitching = state.switching;

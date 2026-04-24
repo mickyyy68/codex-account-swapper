@@ -147,5 +147,6 @@ It writes a marker file when migration is finalized (for example after import, o
 - `session_state_snapshot` — what the observer saw in the session JSONL (error code, rate limits, credits). A snapshot with a non-empty `errorCode` or `primaryUsedPercent >= 100` but no subsequent `usage_watch_fired` indicates a missed pattern.
 - `live_fallback_check` — periodic live rate-limit probe on the active account (independent from the session JSONL).
 - `live_fallback_exhausted` / `usage_watch_fired` — the detector triggered.
+- `tui_usage_limit_detected` — the rendered TUI stream matched a usage-limit error that Codex does not write to the session JSONL (e.g. `Error running remote compact task: ... usage limit`). The wrapper autoswitches from this signal when both the JSONL and the live probe miss it.
 
 Tune the live fallback interval (default 90s) with `CDX_LIVE_FALLBACK_INTERVAL_MS=<ms>`. Set it to `0` to disable.

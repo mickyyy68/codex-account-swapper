@@ -879,6 +879,70 @@ run("autoswitch resume preserves saved access mode flags on the new Codex proces
   );
 });
 
+run("hasTuiUsageLimitError matches the compact-task usage-limit line across wraps", () => {
+  const { hasTuiUsageLimitError } = require("../lib/ccx/session-log");
+
+  // Real sample: Codex prints this in the TUI when its background compact
+  // task hits the usage limit. It does NOT appear in the session JSONL, so
+  // the normal session-state detector cannot see it; the wrapper must
+  // match it directly on the rendered output stream.
+  const wrapped = [
+    "■ Error running remote compact task: You've hit your usage limit. Upgrade to Pro",
+    "(https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or",
+    "try again at Apr 25th, 2026 2:27 AM.",
+  ].join("\n");
+  assert.equal(hasTuiUsageLimitError(wrapped), true);
+
+  const tight = "Error running remote compact task: usage limit reached.";
+  assert.equal(hasTuiUsageLimitError(tight), true);
+
+  // Rate-limit phrasing variant.
+  const rateLimit = "Error running remote compact task: rate-limited by upstream.";
+  assert.equal(hasTuiUsageLimitError(rateLimit), true);
+
+  // Unrelated errors must NOT match.
+  assert.equal(hasTuiUsageLimitError("Error running remote compact task: network timeout."), false);
+  assert.equal(hasTuiUsageLimitError("You've hit your usage limit."), false);
+  assert.equal(hasTuiUsageLimitError(""), false);
+  assert.equal(hasTuiUsageLimitError(null), false);
+
+  // Anchor distance guard: if "usage limit" is far away from the compact
+  // task marker (unrelated line), don't conflate.
+  const faraway = "Error running remote compact task: done.\n" + "x".repeat(500) + "\nusage limit mentioned elsewhere";
+  assert.equal(hasTuiUsageLimitError(faraway), false);
+});
+
+run("wrapper wires TUI usage-limit detector into the Codex onData stream", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  // Codex surfaces certain usage-limit errors only in the rendered TUI
+  // stream (e.g. "Error running remote compact task"), so the wrapper has
+  // to scan the output buffer and trigger autoswitch from there when the
+  // session JSONL and live rate-limit probe both miss the signal.
+  assert.match(source, /hasTuiUsageLimitError,/);
+  assert.match(source, /tuiUsageLimitPatternMatched:\s*false/);
+  assert.match(source, /state\.tuiUsageLimitPatternMatched\s*=\s*false/);
+  assert.match(
+    source,
+    /child\.onData\([\s\S]*?hasTuiUsageLimitError\(state\.outputBuffer\)[\s\S]*?handleTuiUsageLimitDetection\(\)/,
+  );
+  assert.match(source, /function handleTuiUsageLimitDetection/);
+  assert.match(source, /source:\s*"tui"/);
+  assert.match(source, /"tui_usage_limit_detected"/);
+});
+
+run("TUI usage-limit handler honors the skip guard when identity is missing", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  // The handler must defer to shouldHandleUsageLimitEventForState like the
+  // session/live paths; otherwise a rogue TUI match during startup (before
+  // canonical identity is known) would trigger a blind autoswitch.
+  assert.match(
+    source,
+    /function handleTuiUsageLimitDetection[\s\S]*?shouldHandleUsageLimitEventForState\(state, pendingPrompt\)[\s\S]*?usage_watch_skipped/,
+  );
+});
+
 run("tracker can accept an output-derived session id without losing pending discovery", () => {
   const { createSessionIdentityTracker } = require("../lib/ccx/session-identity");
   const tracker = createSessionIdentityTracker();
