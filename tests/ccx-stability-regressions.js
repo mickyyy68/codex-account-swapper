@@ -4,6 +4,18 @@
 const assert = require("node:assert/strict");
 const { resolvePendingPrompt } = require("../lib/ccx/prompt-state");
 const { createOutputPipeline } = require("../lib/ccx/output-pipeline");
+const { resolveResumeVerificationOutcome } = require("../lib/ccx/resume-verification");
+const { formatStartupBanner } = require("../lib/ccx/startup-ui");
+const {
+  formatSwitchingBanner,
+  formatDecisionBanner,
+  formatFailureBanner,
+  formatInfoBanner,
+} = require("../lib/ccx/status-ui");
+const {
+  applyInputChunk,
+  getForwardingChunks,
+} = require("../lib/ccx/input-buffer");
 
 const pendingRuns = [];
 
@@ -16,6 +28,38 @@ function run(name, fn) {
     throw err;
   }));
 }
+
+run("startup banner renders a large green ASCII CDX header", () => {
+  const banner = formatStartupBanner();
+
+  assert.equal(
+    banner,
+    [
+      "\u001b[1;32m  _____   _____  __   __\u001b[0m",
+      "\u001b[1;32m / ____| |  __ \\\\ \\ \\ / /\u001b[0m",
+      "\u001b[1;32m| |      | |  | | \\ V / \u001b[0m",
+      "\u001b[1;32m| |      | |  | |  > <  \u001b[0m",
+      "\u001b[1;32m| |____  | |__| | / . \\\\\u001b[0m",
+      "\u001b[1;32m \\_____| |_____/ /_/ \\_\\\\" + "\u001b[0m",
+    ].join("\r\n"),
+  );
+});
+
+run("wrapper status banners use the green CDX wrapper theme", () => {
+  assert.match(formatSwitchingBanner(), /^\u001b\[1;32m\[CDX\] SWITCHING ACCOUNT\.\.\.\u001b\[0m$/);
+  assert.match(
+    formatDecisionBanner({ ok: true, switched: true, from: "1", to: "2" }),
+    /^\u001b\[1;32m\[CDX\] SWITCHED '1' -> '2'\. Reopening session\.\.\.\u001b\[0m$/,
+  );
+  assert.match(
+    formatFailureBanner("All eligible accounts are exhausted right now."),
+    /^\u001b\[1;32m\[CDX\] All eligible accounts are exhausted right now\.\u001b\[0m$/,
+  );
+  assert.match(
+    formatInfoBanner("Warning: smart switch selected a low-credit account \(0 CR\)\."),
+    /^\u001b\[1;32m\[CDX\] Warning: smart switch selected a low-credit account \(0 CR\)\.\u001b\[0m$/,
+  );
+});
 
 run("approval ui does not become a pending prompt", () => {
   const prompt = resolvePendingPrompt(
@@ -150,7 +194,7 @@ run("strict autoswitch resumes through the orchestrator without prompt options",
 
   assert.match(
     source,
-    /createSwitchOrchestrator\(\{[\s\S]*resumeSession:\s*async\s*\(resumeSessionId\)\s*=>\s*\{\s*await launchCodex\(\["resume", resumeSessionId\]\);\s*\}/,
+    /createSwitchOrchestrator\(\{[\s\S]*resumeSession:\s*async\s*\(resumeSessionId\)\s*=>\s*\{[\s\S]*await launchCodex\(\[\.\.\.accessModeArgs, "resume", resumeSessionId\]\);\s*\}/,
   );
   assert.doesNotMatch(source, /prefillText:/);
   assert.doesNotMatch(source, /autoSubmitPrefill:/);
@@ -276,7 +320,7 @@ run("observer ignores non-exhausted structured session state until a structured 
   });
 
   observer.start();
-  const deadline = Date.now() + 100;
+  const deadline = Date.now() + 250;
   while (Date.now() < deadline && events.length === 0) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
@@ -318,6 +362,74 @@ run("session state usage-limit detection falls back to historical message text",
       },
     }),
     true,
+  );
+});
+
+run("win32 arrow chunks do not mutate the local draft buffer", () => {
+  const arrowUpChunk = "\u001b[0;0;27;1;0;1_\u001b[0;0;91;1;0;1_\u001b[0;0;65;1;0;1_";
+  assert.deepEqual(
+    applyInputChunk("draft", arrowUpChunk),
+    {
+      draft: "draft",
+      submitted: false,
+      changed: false,
+    },
+  );
+});
+
+run("win32 arrow chunks forward vt sequences to the pty", () => {
+  const arrowUpChunk = "\u001b[0;0;27;1;0;1_\u001b[0;0;91;1;0;1_\u001b[0;0;65;1;0;1_";
+  assert.deepEqual(getForwardingChunks(arrowUpChunk), ["\u001b[A"]);
+});
+
+run("wrapper input state preserves draft and forwards vt arrows", () => {
+  const { _internal } = require("../bin/ccx.js");
+  const state = {
+    draftBuffer: "draft",
+    lastSubmittedPrompt: "",
+    outputBuffer: "buffer",
+    outputTransformer: null,
+  };
+  const arrowUpChunk = "\u001b[0;0;27;1;0;1_\u001b[0;0;91;1;0;1_\u001b[0;0;65;1;0;1_";
+
+  const result = _internal.processInputChunkForState(state, arrowUpChunk);
+
+  assert.equal(state.draftBuffer, "draft");
+  assert.equal(result.submittedPrompt, "");
+  assert.deepEqual(result.forwardingChunks, ["\u001b[A"]);
+});
+
+run("win32 arrow chunks with virtual-key-only encoding forward vt sequences", () => {
+  // Real Windows Terminal Win32 input mode for arrow keys uses vkey=<VK_*> and unicode=0.
+  // Up=38, Down=40, Right=39, Left=37, Home=36, End=35, PageUp=33, PageDown=34.
+  const arrowUpChunk = "[38;0;0;1;0;1_";
+  const arrowDownChunk = "[40;0;0;1;0;1_";
+  const arrowLeftChunk = "[37;0;0;1;0;1_";
+  const arrowRightChunk = "[39;0;0;1;0;1_";
+  const homeChunk = "[36;0;0;1;0;1_";
+  const endChunk = "[35;0;0;1;0;1_";
+  const pageUpChunk = "[33;0;0;1;0;1_";
+  const pageDownChunk = "[34;0;0;1;0;1_";
+
+  assert.deepEqual(getForwardingChunks(arrowUpChunk), ["[A"]);
+  assert.deepEqual(getForwardingChunks(arrowDownChunk), ["[B"]);
+  assert.deepEqual(getForwardingChunks(arrowRightChunk), ["[C"]);
+  assert.deepEqual(getForwardingChunks(arrowLeftChunk), ["[D"]);
+  assert.deepEqual(getForwardingChunks(homeChunk), ["[H"]);
+  assert.deepEqual(getForwardingChunks(endChunk), ["[F"]);
+  assert.deepEqual(getForwardingChunks(pageUpChunk), ["[5~"]);
+  assert.deepEqual(getForwardingChunks(pageDownChunk), ["[6~"]);
+});
+
+run("win32 virtual-key-only arrows do not mutate the draft buffer", () => {
+  const arrowUpChunk = "[38;0;0;1;0;1_";
+  assert.deepEqual(
+    applyInputChunk("draft", arrowUpChunk),
+    {
+      draft: "draft",
+      submitted: false,
+      changed: false,
+    },
   );
 });
 
@@ -576,6 +688,70 @@ run("resumed sessions baseline at eof instead of replaying historical lines", ()
   assert.equal(tracker.getState().sessionStateBaselineSize, 512);
 });
 
+run("resume verification stays pending until the resumed session produces stable output", () => {
+  assert.equal(
+    resolveResumeVerificationOutcome({
+      expectedSessionId: "sess-1",
+      confirmedSessionId: "",
+      outputSeen: false,
+      firstOutputAtMs: 0,
+      nowMs: 1_000,
+      processAlive: true,
+      stableDelayMs: 250,
+    }),
+    null,
+  );
+
+  assert.equal(
+    resolveResumeVerificationOutcome({
+      expectedSessionId: "sess-1",
+      confirmedSessionId: "",
+      outputSeen: true,
+      firstOutputAtMs: 900,
+      nowMs: 1_000,
+      processAlive: true,
+      stableDelayMs: 250,
+    }),
+    null,
+  );
+});
+
+run("resume verification accepts stable resumed output even without an echoed session id", () => {
+  assert.deepEqual(
+    resolveResumeVerificationOutcome({
+      expectedSessionId: "sess-1",
+      confirmedSessionId: "",
+      outputSeen: true,
+      firstOutputAtMs: 700,
+      nowMs: 1_000,
+      processAlive: true,
+      stableDelayMs: 250,
+    }),
+    {
+      matched: true,
+      source: "output",
+    },
+  );
+});
+
+run("resume verification rejects a mismatched echoed session id", () => {
+  assert.deepEqual(
+    resolveResumeVerificationOutcome({
+      expectedSessionId: "sess-1",
+      confirmedSessionId: "sess-2",
+      outputSeen: true,
+      firstOutputAtMs: 700,
+      nowMs: 1_000,
+      processAlive: true,
+      stableDelayMs: 250,
+    }),
+    {
+      matched: false,
+      source: "output+sessionId",
+    },
+  );
+});
+
 run("strict autoswitch refuses to proceed without canonical identity", async () => {
   const { createSwitchOrchestrator } = require("../lib/ccx/switch-orchestrator");
   const calls = [];
@@ -622,23 +798,85 @@ run("minimal autoswitch path no longer restores prompts after exhaustion", () =>
   assert.doesNotMatch(source, /autoSubmitPrefill/);
 });
 
-run("strict resume verification does not preload the resumed session id", () => {
+run("resume branch preloads disk-verified sessionId and filePath for observer arming", () => {
   const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
 
-  const resumeBranchStart = source.indexOf('if (Array.isArray(args) && args[0] === "resume"');
+  const resumeBranchStart = source.indexOf("const resumeSessionIdArg = findResumeSessionIdArg(args);");
   const resumeBranchEnd = source.indexOf("discoverSessionFile(", resumeBranchStart);
   const resumeBranch = source.slice(resumeBranchStart, resumeBranchEnd);
 
   assert.notEqual(resumeBranchStart, -1);
   assert.notEqual(resumeBranchEnd, -1);
-  assert.doesNotMatch(resumeBranch, /sessionId:\s*resumedSession\.id/);
+  assert.match(resumeBranch, /sessionId:\s*resumedSession\.id/);
   assert.match(resumeBranch, /sessionFilePath:\s*resumedSession\.filePath/);
+  assert.match(resumeBranch, /state\.resumeVerificationConfirmedSessionId\s*=\s*resumedSession\.id/);
+});
+
+run("findResumeSessionIdArg locates resume regardless of preceding approval flags", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.findResumeSessionIdArg, "function");
+  assert.equal(_internal.findResumeSessionIdArg(["resume", "abc"]), "abc");
+  assert.equal(_internal.findResumeSessionIdArg(["-a", "untrusted", "resume", "abc"]), "abc");
+  assert.equal(_internal.findResumeSessionIdArg(["--ask-for-approval", "on-request", "resume", "xyz"]), "xyz");
+  assert.equal(_internal.findResumeSessionIdArg(["-c", "k=v", "-m", "gpt-5", "resume", "id42"]), "id42");
+  assert.equal(_internal.findResumeSessionIdArg(["-a=untrusted", "resume", "q"]), "q");
+  assert.equal(_internal.findResumeSessionIdArg(["-a", "resume"]), "", "resume as flag value should not be treated as subcommand");
+  assert.equal(_internal.findResumeSessionIdArg([]), "");
+  assert.equal(_internal.findResumeSessionIdArg(["exec", "something"]), "");
 });
 
 run("strict autoswitch clears transient draft state before resuming", () => {
   const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
 
   assert.match(source, /state\.draftBuffer\s*=\s*"";/);
+});
+
+run("extractAccessModeArgs collects saved and explicit access flags", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.extractAccessModeArgs, "function");
+  assert.deepEqual(
+    _internal.extractAccessModeArgs(["--sandbox", "read-only", "--ask-for-approval", "never", "resume", "--last"]),
+    ["--sandbox", "read-only", "--ask-for-approval", "never"],
+  );
+  assert.deepEqual(
+    _internal.extractAccessModeArgs(["--sandbox", "danger-full-access", "--ask-for-approval", "never"]),
+    ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+  );
+  assert.deepEqual(
+    _internal.extractAccessModeArgs(["-s", "workspace-write", "resume", "abc"]),
+    ["-s", "workspace-write"],
+  );
+  assert.deepEqual(
+    _internal.extractAccessModeArgs(["-sread-only", "-a", "untrusted", "resume", "id"]),
+    ["-sread-only", "-a", "untrusted"],
+  );
+  assert.deepEqual(
+    _internal.extractAccessModeArgs(["--sandbox=read-only", "--ask-for-approval=never", "resume", "x"]),
+    ["--sandbox=read-only", "--ask-for-approval=never"],
+  );
+  assert.deepEqual(
+    _internal.extractAccessModeArgs(["resume", "--last"]),
+    [],
+  );
+  assert.deepEqual(_internal.extractAccessModeArgs([]), []);
+  assert.deepEqual(_internal.extractAccessModeArgs(null), []);
+});
+
+run("autoswitch resume preserves saved access mode flags on the new Codex process", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  // Wrapper state must capture access flags from the initial launch so the
+  // resumed session inherits the same sandbox/approval policy. Without this,
+  // a chat reloaded after a rate-limit autoswitch ignores the user's
+  // configured access mode and starts Codex with default permissions.
+  assert.match(source, /initialAccessModeArgs:\s*\[\]/);
+  assert.match(source, /state\.initialAccessModeArgs\s*=\s*extractAccessModeArgs\(forwardedArgs\)/);
+  assert.match(
+    source,
+    /resumeSession:\s*async\s*\(resumeSessionId\)\s*=>\s*\{[\s\S]*accessModeArgs[\s\S]*state\.initialAccessModeArgs[\s\S]*launchCodex\(\[\.\.\.accessModeArgs, "resume", resumeSessionId\]\)/,
+  );
 });
 
 run("tracker can accept an output-derived session id without losing pending discovery", () => {
@@ -1102,6 +1340,189 @@ run("post-switch resume releases switching before re-arming the observer", () =>
   assert.equal(state.switching, false);
   assert.equal(releaseCallbackCalls, 1);
   assert.equal(shouldArmDuringRelease, true);
+});
+
+run("detector matches alternative rate-limit error codes mid-stream", () => {
+  const {
+    isSessionStateUsageLimitExceeded,
+    isUsageLimitErrorCode,
+  } = require("../lib/ccx/session-log");
+
+  assert.equal(isUsageLimitErrorCode("usage_limit_exceeded"), true);
+  assert.equal(isUsageLimitErrorCode("rate_limit_exceeded"), true);
+  assert.equal(isUsageLimitErrorCode("rate_limit_reached"), true);
+  assert.equal(isUsageLimitErrorCode("rate_limited"), true);
+  assert.equal(isUsageLimitErrorCode("quota_exceeded"), true);
+  assert.equal(isUsageLimitErrorCode("something_else"), false);
+
+  assert.equal(
+    isSessionStateUsageLimitExceeded({
+      latestError: { code: "rate_limit_reached", message: "", timestamp: "" },
+      rateLimits: null,
+      latestUserMessage: "",
+    }),
+    true,
+  );
+  assert.equal(
+    isSessionStateUsageLimitExceeded({
+      latestError: { code: "", message: "You've reached your 5-hour limit.", timestamp: "" },
+      rateLimits: null,
+      latestUserMessage: "",
+    }),
+    true,
+  );
+  assert.equal(
+    isSessionStateUsageLimitExceeded({
+      latestError: { code: "", message: "rate-limited for this request.", timestamp: "" },
+      rateLimits: null,
+      latestUserMessage: "",
+    }),
+    true,
+  );
+  assert.equal(
+    isSessionStateUsageLimitExceeded({
+      latestError: { code: "", message: "weekly limit reached.", timestamp: "" },
+      rateLimits: null,
+      latestUserMessage: "",
+    }),
+    true,
+  );
+  assert.equal(
+    isSessionStateUsageLimitExceeded({
+      latestError: { code: "other_error", message: "something unrelated happened.", timestamp: "" },
+      rateLimits: null,
+      latestUserMessage: "",
+    }),
+    false,
+  );
+});
+
+run("observer live fallback fires on exhausted live status and dedups session trigger", async () => {
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
+
+  const liveStatuses = [
+    {
+      available: true,
+      primary: { remainingPercent: 0, resetAtSeconds: 1_700_000_000 },
+      secondary: { remainingPercent: 50, resetAtSeconds: 1_700_100_000 },
+      credits: null,
+      planType: "plus",
+    },
+  ];
+  const debugEvents = [];
+  const usageEvents = [];
+
+  const observer = createSessionObserver({
+    readSessionState: () => null,
+    onSessionStateObserved: () => {},
+    onUsageLimitExceeded: (event) => {
+      usageEvents.push(event);
+    },
+    onDebug: (event, fields) => {
+      debugEvents.push({ event, fields });
+    },
+    intervalMs: 10,
+    getActiveAccountAuthPath: () => "C:/fake/account.auth.json",
+    fetchLiveRateLimitStatus: async () => liveStatuses.shift() || { available: false, errorCode: "unavailable" },
+    liveFallbackIntervalMs: 1_000,
+  });
+
+  observer.start();
+  await new Promise((resolve) => setTimeout(resolve, 1_200));
+  observer.stop();
+
+  assert.equal(usageEvents.length, 1, "should fire exactly once from the live fallback");
+  assert.equal(usageEvents[0].source, "live_fallback");
+  assert.equal(usageEvents[0].sessionState.rateLimits.primary.usedPercent, 100);
+
+  const kinds = debugEvents.map((entry) => entry.event);
+  assert.ok(kinds.includes("live_fallback_check"));
+  assert.ok(kinds.includes("live_fallback_exhausted"));
+  assert.ok(kinds.includes("usage_watch_fired"));
+});
+
+run("observer live fallback stays silent when live status is unavailable", async () => {
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
+
+  const usageEvents = [];
+  const observer = createSessionObserver({
+    readSessionState: () => null,
+    onUsageLimitExceeded: (event) => usageEvents.push(event),
+    intervalMs: 10,
+    getActiveAccountAuthPath: () => "C:/fake/account.auth.json",
+    fetchLiveRateLimitStatus: async () => ({ available: false, errorCode: "missing_rate_limits" }),
+    liveFallbackIntervalMs: 1_000,
+  });
+
+  observer.start();
+  await new Promise((resolve) => setTimeout(resolve, 1_200));
+  observer.stop();
+
+  assert.equal(usageEvents.length, 0);
+});
+
+run("observer live fallback disabled when interval is zero or hooks missing", async () => {
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
+
+  let liveCalls = 0;
+  const observer = createSessionObserver({
+    readSessionState: () => null,
+    onUsageLimitExceeded: () => {},
+    intervalMs: 10,
+    getActiveAccountAuthPath: () => "C:/fake/account.auth.json",
+    fetchLiveRateLimitStatus: async () => {
+      liveCalls += 1;
+      return { available: false };
+    },
+    liveFallbackIntervalMs: 0,
+  });
+
+  observer.start();
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  observer.stop();
+
+  assert.equal(liveCalls, 0, "live fallback should be disabled when interval is 0");
+});
+
+run("diagnoseUsageLimitSkipReason classifies why a usage-limit event is skipped", () => {
+  const { _internal } = require("../bin/ccx.js");
+  const diag = _internal.diagnoseUsageLimitSkipReason;
+
+  assert.equal(diag(null), "invalid_state");
+  assert.equal(diag({ shuttingDown: true }), "shutting_down");
+  assert.equal(diag({ switching: true }), "already_switching");
+  assert.equal(diag({ sessionId: "", sessionFilePath: "" }), "no_session_identity");
+  assert.equal(diag({ sessionId: "", sessionFilePath: "/tmp/foo.jsonl" }), "no_session_id");
+  assert.equal(diag({ sessionId: "abc", sessionFilePath: "" }), "no_session_file_path");
+  assert.equal(diag({ sessionId: "abc", sessionFilePath: "/tmp/foo.jsonl" }), "unknown");
+});
+
+run("observer emits a snapshot debug event when an unrecognized error appears", async () => {
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
+
+  const debugEvents = [];
+  const states = [
+    {
+      latestError: { code: "weird_code", message: "something weird", timestamp: "2025-01-01T00:00:00Z" },
+      rateLimits: null,
+      latestUserMessage: "hi",
+    },
+  ];
+  const observer = createSessionObserver({
+    readSessionState: () => states.shift() || null,
+    onUsageLimitExceeded: () => {},
+    onDebug: (event, fields) => debugEvents.push({ event, fields }),
+    intervalMs: 20,
+  });
+
+  observer.start();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  observer.stop();
+
+  const snapshot = debugEvents.find((entry) => entry.event === "session_state_snapshot");
+  assert.ok(snapshot, "should emit session_state_snapshot when state changes");
+  assert.equal(snapshot.fields.triggered, false);
+  assert.equal(snapshot.fields.errorCode, "weird_code");
 });
 
 Promise.all(pendingRuns)

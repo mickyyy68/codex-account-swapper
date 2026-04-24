@@ -34,6 +34,7 @@ const {
 const {
   formatSwitchingBanner,
   formatDecisionBanner,
+  formatInfoBanner,
 } = require("../lib/ccx/status-ui");
 const {
   restoreTerminalState,
@@ -53,16 +54,123 @@ const {
 const {
   createSwitchOrchestrator,
 } = require("../lib/ccx/switch-orchestrator");
+const {
+  resolveResumeVerificationOutcome,
+} = require("../lib/ccx/resume-verification");
 
 const CODEX_HOME_DIR = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const SESSIONS_DIR = path.join(CODEX_HOME_DIR, "sessions");
 const TARGET_AUTH = path.join(CODEX_HOME_DIR, "auth.json");
 const CDX_STATE_DIR = path.join(os.homedir(), ".cdx");
-const CCX_DEBUG_LOG = path.join(CDX_STATE_DIR, "ccx.log");
+const CDX_DEBUG_LOG = path.join(CDX_STATE_DIR, "cdx.log");
 const DISCOVERY_INTERVAL_MS = 250;
 const DISCOVERY_TIMEOUT_MS = 30_000;
 const SESSION_ID_WAIT_TIMEOUT_MS = 30_000;
 const OUTPUT_BUFFER_MAX_CHARS = 16_000;
+const RESUME_OUTPUT_STABLE_DELAY_MS = 300;
+const DEFAULT_LIVE_FALLBACK_INTERVAL_MS = 90_000;
+const MIN_LIVE_FALLBACK_INTERVAL_MS = 15_000;
+
+function resolveLiveFallbackIntervalMs() {
+  const raw = process.env.CDX_LIVE_FALLBACK_INTERVAL_MS;
+  if (raw === undefined) {
+    return DEFAULT_LIVE_FALLBACK_INTERVAL_MS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 0;
+  }
+  return Math.max(MIN_LIVE_FALLBACK_INTERVAL_MS, parsed);
+}
+
+const CODEX_FLAGS_WITH_VALUE = new Set([
+  "-a",
+  "--ask-for-approval",
+  "-c",
+  "--config",
+  "-m",
+  "--model",
+  "-p",
+  "--profile",
+  "-C",
+  "--cd",
+  "--output-last-message",
+  "--output-schema",
+  "-i",
+  "--image",
+  "-s",
+  "--sandbox",
+  "--oss",
+]);
+
+function findResumeSessionIdArg(args) {
+  if (!Array.isArray(args)) {
+    return "";
+  }
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index];
+    if (typeof token !== "string") {
+      continue;
+    }
+    if (token === "resume") {
+      const next = args[index + 1];
+      return typeof next === "string" ? next : "";
+    }
+    if (CODEX_FLAGS_WITH_VALUE.has(token)) {
+      index += 1;
+      continue;
+    }
+    if (/^(?:-[a-zA-Z]|--[a-zA-Z][\w-]*)=/.test(token)) {
+      continue;
+    }
+  }
+  return "";
+}
+
+function extractAccessModeArgs(args) {
+  if (!Array.isArray(args)) {
+    return [];
+  }
+  const result = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index];
+    if (typeof token !== "string") {
+      continue;
+    }
+    if (token === "-s" || token === "--sandbox" || token === "-a" || token === "--ask-for-approval") {
+      result.push(token);
+      const next = args[index + 1];
+      if (typeof next === "string") {
+        result.push(next);
+        index += 1;
+      }
+      continue;
+    }
+    if (/^--sandbox=.+$/.test(token) || /^--ask-for-approval=.+$/.test(token)) {
+      result.push(token);
+      continue;
+    }
+    if (/^-s.+$/.test(token) || /^-a.+$/.test(token)) {
+      result.push(token);
+      continue;
+    }
+  }
+  return result;
+}
+
+function resolveActiveAccountAuthPath() {
+  try {
+    const activeName = cdxInternal.getActive();
+    if (!activeName) {
+      return "";
+    }
+    const accounts = cdxInternal.readAccounts();
+    const entry = accounts.find((account) => account.name === activeName);
+    return entry && typeof entry.path === "string" ? entry.path : "";
+  } catch (_) {
+    return "";
+  }
+}
 let cachedPtyModule = null;
 
 function loadPtyRuntimeModule() {
@@ -108,7 +216,7 @@ function writeDebugLog(event, fields = {}) {
       event,
       ...fields,
     });
-    fs.appendFileSync(CCX_DEBUG_LOG, `${line}\n`, "utf8");
+    fs.appendFileSync(CDX_DEBUG_LOG, `${line}\n`, "utf8");
   } catch (_) {
     // ignore logging failures
   }
@@ -164,10 +272,12 @@ function createSupervisor() {
     resumeVerificationExpectedSessionId: "",
     resumeVerificationConfirmedSessionId: "",
     resumeVerificationOutputSeen: false,
+    resumeVerificationFirstOutputAtMs: 0,
     sessionIdentityTracker: identityTracker,
     sessionObserver: null,
     launchNonce: 0,
     shuttingDown: false,
+    initialAccessModeArgs: [],
   };
 }
 
@@ -222,6 +332,7 @@ function resetResumeVerificationState(state) {
   state.resumeVerificationExpectedSessionId = "";
   state.resumeVerificationConfirmedSessionId = "";
   state.resumeVerificationOutputSeen = false;
+  state.resumeVerificationFirstOutputAtMs = 0;
 }
 
 function ensureSessionIdentityTracker(state, options = {}) {
@@ -480,6 +591,29 @@ function applyObservedSessionIdentityForState(state, sessionIdentity = {}) {
   return resolveSessionIdentityForState(state);
 }
 
+function diagnoseUsageLimitSkipReason(state) {
+  if (!state || typeof state !== "object") {
+    return "invalid_state";
+  }
+  if (state.shuttingDown === true) {
+    return "shutting_down";
+  }
+  if (state.switching === true) {
+    return "already_switching";
+  }
+  const sessionIdentity = resolveSessionIdentityForState(state);
+  if (!sessionIdentity) {
+    return "no_session_identity";
+  }
+  if (!sessionIdentity.sessionId) {
+    return "no_session_id";
+  }
+  if (!sessionIdentity.sessionFilePath) {
+    return "no_session_file_path";
+  }
+  return "unknown";
+}
+
 function shouldHandleUsageLimitEventForState(state, eventOrPrompt = "") {
   const sessionIdentity = resolveSessionIdentityForState(state);
 
@@ -530,10 +664,11 @@ async function main({ forwardedArgs }) {
     currentAuthPath: TARGET_AUTH,
   });
   if (bootstrap.message) {
-    writeStatusLine(`[CDX] ${bootstrap.message}`);
+    writeStatusLine(formatInfoBanner(bootstrap.message));
   }
 
   const state = createSupervisor();
+  state.initialAccessModeArgs = extractAccessModeArgs(forwardedArgs);
 
   function cleanup() {
     if (state.shuttingDown) {
@@ -653,14 +788,24 @@ async function main({ forwardedArgs }) {
       onUsageLimitExceeded: (event) => {
         syncObservedSessionStateForState(state, event && event.sessionState);
         const pendingPrompt = resolveUsageLimitPromptForState(state, event);
+        const source = event && event.source ? event.source : "session";
         writeDebugLog("usage_watch_completed", {
           matched: true,
           cancelled: false,
           sessionId: state.sessionId,
           sessionFilePath: state.sessionFilePath,
           pendingPrompt,
+          source,
         });
         if (!shouldHandleUsageLimitEventForState(state, pendingPrompt)) {
+          writeDebugLog("usage_watch_skipped", {
+            source,
+            reason: diagnoseUsageLimitSkipReason(state),
+            sessionId: state.sessionId,
+            sessionFilePath: state.sessionFilePath,
+            switching: state.switching === true,
+            shuttingDown: state.shuttingDown === true,
+          });
           return;
         }
         observer.stop();
@@ -676,7 +821,11 @@ async function main({ forwardedArgs }) {
           die(err.message || String(err));
         });
       },
+      onDebug: writeDebugLog,
       intervalMs: 100,
+      getActiveAccountAuthPath: resolveActiveAccountAuthPath,
+      fetchLiveRateLimitStatus: (authPath) => cdxInternal.getLiveRateLimitStatus(authPath, { forceRefresh: true }),
+      liveFallbackIntervalMs: resolveLiveFallbackIntervalMs(),
     });
     state.sessionObserver = observer;
     observer.start();
@@ -716,6 +865,9 @@ async function main({ forwardedArgs }) {
       process.stdout.write(outputTransformer.transform(data));
       state.outputBuffer = updateOutputBuffer(state.outputBuffer, data);
       if (state.resumeVerificationExpectedSessionId) {
+        if (!state.resumeVerificationOutputSeen) {
+          state.resumeVerificationFirstOutputAtMs = Date.now();
+        }
         state.resumeVerificationOutputSeen = true;
       }
       updateSessionIdentityFromOutput();
@@ -738,15 +890,26 @@ async function main({ forwardedArgs }) {
     });
 
     const launchToken = { cancelled: false };
-    if (Array.isArray(args) && args[0] === "resume" && typeof args[1] === "string" && args[1]) {
-      state.resumeVerificationExpectedSessionId = args[1];
+    const resumeSessionIdArg = findResumeSessionIdArg(args);
+    if (resumeSessionIdArg) {
+      state.resumeVerificationExpectedSessionId = resumeSessionIdArg;
       const resumedSession = findSessionFileById({
         sessionsDir: SESSIONS_DIR,
-        sessionId: args[1],
+        sessionId: resumeSessionIdArg,
       });
       if (resumedSession) {
         applyObservedSessionIdentity({
+          sessionId: resumedSession.id,
           sessionFilePath: resumedSession.filePath,
+        });
+        state.resumeVerificationConfirmedSessionId = resumedSession.id;
+        writeDebugLog("resume_session_identity_attached", {
+          sessionId: resumedSession.id,
+          sessionFilePath: resumedSession.filePath,
+        });
+      } else {
+        writeDebugLog("resume_session_file_not_found", {
+          sessionId: resumeSessionIdArg,
         });
       }
     }
@@ -825,26 +988,36 @@ async function main({ forwardedArgs }) {
         }
       },
       resumeSession: async (resumeSessionId) => {
-        await launchCodex(["resume", resumeSessionId]);
+        const accessModeArgs = Array.isArray(state.initialAccessModeArgs)
+          ? state.initialAccessModeArgs
+          : [];
+        await launchCodex([...accessModeArgs, "resume", resumeSessionId]);
       },
       verifyResumedSession: async (expectedSessionId) => {
-        const confirmedSessionId = await waitForTruthyValue(
+        const outcome = await waitForTruthyValue(
           () => {
             updateSessionIdentityFromOutput();
-            if (!state.resumeVerificationOutputSeen) {
-              return null;
-            }
-            if (!state.resumeVerificationConfirmedSessionId) {
-              return null;
-            }
-            return state.resumeVerificationConfirmedSessionId;
+            return resolveResumeVerificationOutcome({
+              expectedSessionId,
+              confirmedSessionId: state.resumeVerificationConfirmedSessionId,
+              outputSeen: state.resumeVerificationOutputSeen,
+              firstOutputAtMs: state.resumeVerificationFirstOutputAtMs,
+              nowMs: Date.now(),
+              processAlive: Boolean(state.ptyProcess),
+              stableDelayMs: RESUME_OUTPUT_STABLE_DELAY_MS,
+            });
           },
           { timeoutMs: SESSION_ID_WAIT_TIMEOUT_MS, intervalMs: 100 },
         );
-        return Boolean(
-          confirmedSessionId &&
-          confirmedSessionId === expectedSessionId
-        );
+        if (!outcome || !outcome.matched) {
+          return false;
+        }
+        const currentIdentity = resolveSessionIdentityForState(state) || {};
+        applyObservedSessionIdentityForState(state, {
+          sessionId: expectedSessionId,
+          sessionFilePath: currentIdentity.sessionFilePath || sessionIdentity.sessionFilePath,
+        });
+        return true;
       },
     });
 
@@ -859,9 +1032,9 @@ async function main({ forwardedArgs }) {
     writeStatusLine(formatDecisionBanner(result));
     await sleep(150);
     if (result.recommendedStatus && result.recommendedStatus.lowCredits) {
-      writeStatusLine(
-        `[CDX] Warning: smart switch selected a low-credit account (${result.recommendedStatus.credits ? result.recommendedStatus.credits.balance : "?"}).`,
-      );
+      writeStatusLine(formatInfoBanner(
+        `Warning: smart switch selected a low-credit account (${result.recommendedStatus.credits ? result.recommendedStatus.credits.balance : "?"}).`,
+      ));
     }
 
     releaseSwitchingStateForState(state, ensureSessionObserverRunning);
@@ -936,6 +1109,11 @@ module.exports = {
     shouldHandleUsageLimitEventForState,
     releaseSwitchingStateForState,
     resolveUsageLimitPromptForState,
+    findResumeSessionIdArg,
+    extractAccessModeArgs,
+    resolveActiveAccountAuthPath,
+    resolveLiveFallbackIntervalMs,
+    diagnoseUsageLimitSkipReason,
   },
 };
 

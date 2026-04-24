@@ -8,9 +8,32 @@ const path = require("node:path");
 
 const { decideCdxMode } = require("../lib/cdx/dispatcher");
 const { runManualEntryPoint } = require("../lib/cdx/manual");
+const { readCdxSettings, writeCdxSettings } = require("../lib/cdx/settings");
 const { runCodexWrapper } = require("../lib/cdx/wrapper");
+const { runAccountListPrompt } = require("../lib/cdx/account-list-prompt");
+const {
+  findMatchingSavedAccount,
+  getFirstAvailableNumericAccountName,
+} = require("../lib/ccx/current-account");
+const {
+  DEFAULT_CLEANUP_THRESHOLD,
+  readAccountHealth,
+  writeAccountHealth,
+  decideAccountCleanups,
+} = require("../lib/cdx/account-health");
+const { isOnline } = require("../lib/cdx/connectivity");
 
-const CDX_DIR = process.env.CDX_DIR || path.join(os.homedir(), ".cdx");
+function resolveCdxDir(envValue = process.env.CDX_DIR) {
+  if (typeof envValue === "string") {
+    const trimmed = envValue.trim();
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+  return path.join(os.homedir(), ".cdx");
+}
+
+const CDX_DIR = resolveCdxDir();
 const ACCOUNTS_FILE = path.join(CDX_DIR, "accounts.json");
 const LEGACY_ACCOUNTS_FILE = path.join(CDX_DIR, "accounts.tsv");
 const MIGRATION_MARKER = path.join(CDX_DIR, ".migration_accounts_tsv_v1.done");
@@ -578,24 +601,6 @@ function getAccountEmail(accountPath) {
   return getAccountMetadata(accountPath).email;
 }
 
-function getAccountPlanType(accountPath) {
-  return getAccountMetadata(accountPath).planType;
-}
-
-function formatAccountNameWithEmail(name, email) {
-  if (!email) {
-    return name;
-  }
-  if (name.toLowerCase().includes(email.toLowerCase())) {
-    return name;
-  }
-  return `${name} <${email}>`;
-}
-
-function accountDisplayName(account) {
-  return formatAccountNameWithEmail(account.name, getAccountEmail(account.path));
-}
-
 function applyAuthFile(sourceAuth) {
   if (!isRegularFile(sourceAuth)) {
     die(`auth file does not exist: ${sourceAuth}`);
@@ -611,20 +616,6 @@ function applyAuthFile(sourceAuth) {
   } catch (_) {
     // Ignore chmod failures on non-POSIX systems.
   }
-}
-
-function opAdd(name, rawPath) {
-  const fullPath = path.resolve(rawPath);
-  if (!isRegularFile(fullPath)) {
-    die(`auth file not found: ${fullPath}`);
-  }
-
-  const accounts = readAccounts();
-  writeAccounts(upsertAccount(accounts, name, fullPath));
-  if (!getActive()) {
-    setActive(name);
-  }
-  return `Registered account '${name}' -> ${fullPath}`;
 }
 
 function opSave(name) {
@@ -687,29 +678,6 @@ function opRename(oldName, newName) {
   return `Renamed account '${oldName}' to '${newName}'`;
 }
 
-function opSwap(aName, bName) {
-  const accounts = readAccounts();
-  if (accounts.length < 2) {
-    die("need at least 2 configured accounts to swap");
-  }
-
-  const firstIndex = accounts.findIndex((entry) => entry.name === aName);
-  const secondIndex = accounts.findIndex((entry) => entry.name === bName);
-  if (firstIndex < 0 || secondIndex < 0) {
-    die("unknown account selected for swap");
-  }
-
-  if (firstIndex === secondIndex) {
-    return "Swap target is the same account; nothing changed.";
-  }
-
-  const firstName = accounts[firstIndex].name;
-  const secondName = accounts[secondIndex].name;
-  [accounts[firstIndex], accounts[secondIndex]] = [accounts[secondIndex], accounts[firstIndex]];
-  writeAccounts(accounts);
-  return `Swapped '${firstName}' with '${secondName}'`;
-}
-
 function opRemove(name) {
   const accounts = readAccounts();
   const removed = findAccount(accounts, name);
@@ -722,6 +690,21 @@ function opRemove(name) {
 
   if (isManagedSnapshot(removed.path) && isRegularFile(removed.path)) {
     fs.rmSync(removed.path, { force: true });
+  }
+
+  try {
+    pruneLiveRateLimitCache(removed.path);
+  } catch (_) {
+    // cache pruning is best-effort
+  }
+  try {
+    const health = readAccountHealth();
+    if (Object.prototype.hasOwnProperty.call(health, name)) {
+      delete health[name];
+      writeAccountHealth(health);
+    }
+  } catch (_) {
+    // health persistence is best-effort
   }
 
   const active = getActive();
@@ -791,24 +774,6 @@ function formatRepairSummary(repair) {
   }
 
   return parts.join(". ");
-}
-
-function toAccountOptions(accounts, activeName, disabledName) {
-  return accounts.map((account) => {
-    const metadata = getAccountMetadata(account.path);
-
-    return {
-      value: account.name,
-      label: buildAccountLabel(account.name, metadata.email, [
-        formatPlanBadge(metadata.planType),
-        formatPinnedBadge(account.pinned === true),
-        formatExcludedBadge(account.excludedFromRecommendation === true),
-        formatActiveBadge(account.name === activeName),
-      ]),
-      hint: account.path,
-      disabled: account.name === disabledName,
-    };
-  });
 }
 
 function pruneLiveRateLimitCache(accountPath) {
@@ -1539,45 +1504,19 @@ function getStatusRecommendation(status) {
     return null;
   }
 
-  const depleted = windows.filter(isWindowDepleted);
   const primaryRemaining = getRemainingPercent(status.primary);
   const secondaryRemaining = status.secondary ? getRemainingPercent(status.secondary) : 101;
-  const totalRemaining = windows.reduce((sum, summary) => sum + Math.max(0, getRemainingPercent(summary)), 0);
-  const bottleneckRemaining = windows.reduce(
-    (current, summary) => Math.min(current, Math.max(0, getRemainingPercent(summary))),
-    Number.POSITIVE_INFINITY,
-  );
-  const depletedReset = depleted.reduce(
-    (current, summary) => Math.min(current, getResetSortValue(summary)),
-    Number.POSITIVE_INFINITY,
-  );
-  const lowCredits = statusHasLowCredits(status);
-  const zeroCredits = statusHasZeroCredits(status);
   const creditBalance = getCreditBalanceValue(status);
+  const primaryReset = getResetSortValue(status.primary);
+  const usableNow = isStatusUsableNow(status);
 
-  return depleted.length === 0 && !zeroCredits
-    ? {
-        tier: lowCredits ? 1 : 0,
-        bottleneckRemaining,
-        primaryRemaining,
-        secondaryRemaining,
-        totalRemaining,
-        depletedCount: 0,
-        depletedReset,
-        lowCredits,
-        creditBalance,
-      }
-    : {
-        tier: 2,
-        bottleneckRemaining,
-        primaryRemaining,
-        secondaryRemaining,
-        totalRemaining,
-        depletedCount: depleted.length,
-        depletedReset,
-        lowCredits,
-        creditBalance,
-      };
+  return {
+    usableNow,
+    primaryRemaining,
+    secondaryRemaining,
+    creditBalance,
+    primaryReset,
+  };
 }
 
 function compareRecommendationMetrics(left, right) {
@@ -1591,28 +1530,14 @@ function compareRecommendationMetrics(left, right) {
     return 1;
   }
 
-  const comparators = left.tier === 2 && right.tier === 2
-    ? [
-        [left.tier, right.tier, true],
-        [left.depletedCount, right.depletedCount, true],
-        [left.depletedReset, right.depletedReset, true],
-        [left.creditBalance, right.creditBalance, false],
-        [left.pinned ? 0 : 1, right.pinned ? 0 : 1, true],
-        [left.primaryRemaining, right.primaryRemaining, false],
-        [left.secondaryRemaining, right.secondaryRemaining, false],
-        [left.totalRemaining, right.totalRemaining, false],
-      ]
-    : [
-        [left.tier, right.tier, true],
-        [left.depletedCount, right.depletedCount, true],
-        [left.creditBalance, right.creditBalance, false],
-        [left.pinned ? 0 : 1, right.pinned ? 0 : 1, true],
-        [left.bottleneckRemaining, right.bottleneckRemaining, false],
-        [left.primaryRemaining, right.primaryRemaining, false],
-        [left.secondaryRemaining, right.secondaryRemaining, false],
-        [left.totalRemaining, right.totalRemaining, false],
-        [left.depletedReset, right.depletedReset, true],
-      ];
+  const comparators = [
+    [left.usableNow ? 0 : 1, right.usableNow ? 0 : 1, true],
+    [left.pinned ? 0 : 1, right.pinned ? 0 : 1, true],
+    [left.primaryRemaining, right.primaryRemaining, false],
+    [left.secondaryRemaining, right.secondaryRemaining, false],
+    [left.creditBalance, right.creditBalance, false],
+    [left.primaryReset, right.primaryReset, true],
+  ];
 
   for (const [a, b, ascending] of comparators) {
     if (a === b) {
@@ -1646,17 +1571,12 @@ function getRecommendedSwitchAccount(entries, activeName = "", disabledName = ""
     if (comparison !== 0) {
       return comparison;
     }
-    if (left.account.name === activeName && right.account.name !== activeName) {
-      return -1;
-    }
-    if (right.account.name === activeName && left.account.name !== activeName) {
-      return 1;
-    }
     return left.index - right.index;
   });
 
-  return decorated[0] && decorated[0].recommendation && decorated[0].recommendation.tier < 2
-    ? decorated[0].account.name
+  const top = decorated[0];
+  return top && top.recommendation && top.recommendation.usableNow
+    ? top.account.name
     : "";
 }
 
@@ -1696,6 +1616,27 @@ function formatDepletedBadge(summary) {
   return colorize(`[${summary.label.toUpperCase()} 0%]`, "boldRed");
 }
 
+function formatFiveHourInline(status) {
+  if (!status || !status.available || !status.primary) {
+    return colorize("5h   — (reset —)", "dim");
+  }
+  const remainingRaw = Number(status.primary.remainingPercent);
+  if (!Number.isFinite(remainingRaw)) {
+    return colorize("5h   — (reset —)", "dim");
+  }
+  const clamped = Math.max(0, Math.min(100, remainingRaw));
+  const percentText = String(clamped).padStart(3);
+  const resetAt = status.primary && status.primary.resetAt ? String(status.primary.resetAt) : "—";
+  const text = `5h ${percentText}% (reset ${resetAt})`;
+  let style = "boldGreen";
+  if (clamped < 34) {
+    style = "boldRed";
+  } else if (clamped < 67) {
+    style = "boldYellow";
+  }
+  return colorize(text, style);
+}
+
 function formatCreditsBadge(status) {
   const balanceLabel = getCreditBalanceLabel(status);
   if (!balanceLabel) {
@@ -1710,26 +1651,63 @@ function formatCreditsBadge(status) {
   return "";
 }
 
-function buildAccountLabel(name, email, badges = []) {
-  const label = formatAccountNameWithEmail(name, email);
-  const suffix = badges.filter(Boolean).join(" ");
-  return suffix ? `${label} ${suffix}` : label;
+const SWITCH_LABEL_COLUMN_GAP = "   ";
+const SWITCH_LABEL_BADGE_GAP = "  ";
+const MAX_EMAIL_COLUMN_WIDTH = 32;
+
+function padColumn(value, width, align = "left") {
+  const text = String(value == null ? "" : value);
+  if (!Number.isInteger(width) || width <= 0 || text.length >= width) {
+    return text;
+  }
+  return align === "right" ? text.padStart(width) : text.padEnd(width);
 }
 
-function buildSwitchAccountLabel(account, status, activeName = "", recommendedName = "") {
+function truncateToWidth(value, maxWidth) {
+  const text = String(value == null ? "" : value);
+  if (!Number.isInteger(maxWidth) || maxWidth <= 0 || text.length <= maxWidth) {
+    return text;
+  }
+  if (maxWidth === 1) {
+    return "…";
+  }
+  return `${text.slice(0, maxWidth - 1)}…`;
+}
+
+function buildSwitchAccountLabel(account, status, activeName = "", recommendedName = "", layout = {}) {
   const metadata = getAccountMetadata(account.path);
   const email = status && status.email ? status.email : metadata.email;
-  const planType = status && status.planType ? status.planType : metadata.planType;
-  return buildAccountLabel(account.name, email, [
-    formatPlanBadge(planType),
+
+  const nameWidth = Number.isInteger(layout.nameWidth) && layout.nameWidth > 0
+    ? layout.nameWidth
+    : (account.name ? account.name.length : 0);
+  const emailWidth = Number.isInteger(layout.emailWidth) && layout.emailWidth > 0
+    ? layout.emailWidth
+    : (email ? Math.min(email.length, MAX_EMAIL_COLUMN_WIDTH) : 0);
+
+  const nameColumn = padColumn(account.name || "", nameWidth, "right");
+  const emailText = email ? truncateToWidth(email, emailWidth) : "";
+  const emailColumn = email ? padColumn(emailText, emailWidth, "left") : "";
+  const fiveHour = formatFiveHourInline(status);
+
+  const badges = [
     formatPinnedBadge(account.pinned === true),
     formatExcludedBadge(account.excludedFromRecommendation === true),
-    formatDepletedBadge(status && status.primary),
     formatDepletedBadge(status && status.secondary),
     formatCreditsBadge(status),
     formatRecommendedBadge(account.name === recommendedName),
     formatActiveBadge(account.name === activeName),
-  ]);
+  ].filter(Boolean).join(SWITCH_LABEL_BADGE_GAP);
+
+  const parts = [nameColumn];
+  if (emailColumn) {
+    parts.push(emailColumn);
+  }
+  parts.push(fiveHour);
+  if (badges) {
+    parts.push(badges);
+  }
+  return parts.join(SWITCH_LABEL_COLUMN_GAP);
 }
 
 function formatRateLimitHint(summary) {
@@ -1751,14 +1729,14 @@ function statusHasDepletedLimit(status) {
   return getDepletedLimitLabels(status).length > 0;
 }
 
-function buildSwitchAccountHint(account, activeName, status) {
-  const hints = [];
+const SWITCH_HINT_SEPARATOR = "  ·  ";
 
+function buildSwitchAccountHint(account, activeName, status) {
   if (!status || !status.available) {
-    hints.push("limits unavailable");
-    return hints.join(" | ");
+    return "limits unavailable";
   }
 
+  const hints = [];
   if (status.primary) {
     hints.push(formatRateLimitHint(status.primary));
   }
@@ -1772,10 +1750,10 @@ function buildSwitchAccountHint(account, activeName, status) {
   }
 
   if (hints.length === 0) {
-    hints.push("limits unavailable");
+    return "limits unavailable";
   }
 
-  return hints.join(" | ");
+  return hints.join(SWITCH_HINT_SEPARATOR);
 }
 
 async function mapWithConcurrency(items, concurrency, worker) {
@@ -1803,9 +1781,25 @@ async function loadSwitchAccountEntries(accounts, options = {}) {
 
 function buildSwitchAccountSelection(entries, activeName, disabledName) {
   const recommendedValue = getRecommendedSwitchAccount(entries, activeName, disabledName);
+
+  const resolvedEmails = entries.map(({ account, status }) => {
+    const md = getAccountMetadata(account.path);
+    const email = status && status.email ? status.email : md.email;
+    return typeof email === "string" ? email : "";
+  });
+  const nameWidth = entries.reduce(
+    (max, { account }) => Math.max(max, account.name ? account.name.length : 0),
+    0,
+  );
+  const emailWidth = Math.min(
+    MAX_EMAIL_COLUMN_WIDTH,
+    resolvedEmails.reduce((max, email) => Math.max(max, email.length), 0),
+  );
+  const layout = { nameWidth, emailWidth };
+
   const options = entries.map(({ account, status }) => ({
     value: account.name,
-    label: buildSwitchAccountLabel(account, status, activeName, recommendedValue),
+    label: buildSwitchAccountLabel(account, status, activeName, recommendedValue, layout),
     hint: buildSwitchAccountHint(account, activeName, status),
     disabled: account.name === disabledName,
   }));
@@ -1952,10 +1946,23 @@ async function runSmartSwitchOperation(options = {}) {
     };
   }
 
-  const entries = await loadSwitchAccountEntries(accounts, {
+  const { entries: keptEntries } = await fetchEntriesWithCleanup(null, accounts, activeName, {
     forceRefresh: !!(options && options.forceRefreshLiveLimits),
   });
-  const selection = buildSwitchAccountSelection(entries, activeName, "");
+  if (keptEntries.length === 0) {
+    return {
+      ok: false,
+      switched: false,
+      alreadyOptimal: false,
+      allExhausted: false,
+      from: activeName || "",
+      to: "",
+      reason: "no_accounts",
+      activeStatus: null,
+      recommendedStatus: null,
+    };
+  }
+  const selection = buildSwitchAccountSelection(keptEntries, activeName, "");
   const decision = getSmartSwitchDecisionFromSelection(selection, activeName);
   if (!decision.ok || decision.alreadyOptimal || !decision.to) {
     return decision;
@@ -1968,44 +1975,260 @@ async function runSmartSwitchOperation(options = {}) {
   };
 }
 
-function displayAccountList(p) {
-  const active = getActive();
-  const accounts = readAccounts();
-  if (accounts.length === 0) {
-    p.log.warn("No accounts configured.");
-    return;
-  }
 
-  const lines = accounts.map((account, index) => {
-    const marker = account.name === active ? "*" : " ";
-    const metadata = getAccountMetadata(account.path);
-    const label = buildAccountLabel(account.name, metadata.email, [
-      formatPlanBadge(metadata.planType),
-      formatPinnedBadge(account.pinned === true),
-      formatExcludedBadge(account.excludedFromRecommendation === true),
-      formatActiveBadge(account.name === active),
-    ]);
-    return `${String(index + 1).padStart(2, " ")} ${marker} ${label}  ${account.path}`;
-  });
-  p.note(lines.join("\n"), "Configured Accounts");
-}
-
-async function loadSwitchAccountSelection(p, accounts, activeName, disabledName) {
+async function loadSwitchAccountEntriesWithLoading(p, accounts, options = {}) {
   const shouldShowLoading = accounts.some((account) => !hasFreshLiveRateLimitCache(account.path));
-  const loading = shouldShowLoading && typeof p.spinner === "function" ? p.spinner() : null;
+  const loading = shouldShowLoading && p && typeof p.spinner === "function" ? p.spinner() : null;
 
   if (loading) {
     loading.start("Loading account info...");
   }
 
   try {
-    const entries = await loadSwitchAccountEntries(accounts);
-    return buildSwitchAccountSelection(entries, activeName, disabledName);
+    return await loadSwitchAccountEntries(accounts, options);
   } finally {
     if (loading) {
       loading.clear();
     }
   }
+}
+
+async function fetchEntriesWithCleanup(p, accounts, activeName, options = {}) {
+  const cacheFreshness = new Map(
+    accounts.map((account) => [account.name, hasFreshLiveRateLimitCache(account.path)]),
+  );
+  const entries = await loadSwitchAccountEntriesWithLoading(p, accounts, options);
+  const cleanup = await performAccountCleanup(p, {
+    entries,
+    cacheFreshness,
+    activeName,
+  });
+  const keptEntries = cleanup.deletedNames.size > 0
+    ? entries.filter((entry) => !cleanup.deletedNames.has(entry.account.name))
+    : entries;
+  return { entries: keptEntries, cleanup };
+}
+
+async function loadSwitchAccountSelection(p, accounts, activeName, disabledName) {
+  const entries = await loadSwitchAccountEntriesWithLoading(p, accounts);
+  return buildSwitchAccountSelection(entries, activeName, disabledName);
+}
+
+function sortEntriesByFiveHour(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return [];
+  }
+  const decorated = entries.map((entry, index) => {
+    const status = entry && entry.status ? entry.status : null;
+    const primary = status && status.primary ? status.primary : null;
+    return {
+      entry,
+      index,
+      available: !!(status && status.available),
+      primaryRemaining: getRemainingPercent(primary),
+    };
+  });
+  decorated.sort((a, b) => {
+    if (a.available !== b.available) {
+      return a.available ? -1 : 1;
+    }
+    if (a.primaryRemaining !== b.primaryRemaining) {
+      return b.primaryRemaining - a.primaryRemaining;
+    }
+    return a.index - b.index;
+  });
+  return decorated.map((d) => d.entry);
+}
+
+function evaluateCurrentAuthRegistration() {
+  if (!isRegularFile(TARGET_AUTH)) {
+    return { needed: false, reason: "no_codex_auth" };
+  }
+  const currentMetadata = getAccountMetadata(TARGET_AUTH);
+  const hasIdentity = !!(
+    (currentMetadata && typeof currentMetadata.accountId === "string" && currentMetadata.accountId.trim()) ||
+    (currentMetadata && typeof currentMetadata.email === "string" && currentMetadata.email.trim())
+  );
+  if (!hasIdentity) {
+    return { needed: false, reason: "missing_identity" };
+  }
+  const accounts = readAccounts();
+  const matched = findMatchingSavedAccount(accounts, currentMetadata, getAccountMetadata);
+  if (matched) {
+    return { needed: false, reason: "already_saved", matchedName: matched.name };
+  }
+  return {
+    needed: true,
+    reason: "unsaved",
+    currentEmail: currentMetadata.email || "",
+    suggestedName: getFirstAvailableNumericAccountName(accounts),
+  };
+}
+
+async function promptCurrentAuthRegistrationIfNeeded(p) {
+  const decision = evaluateCurrentAuthRegistration();
+  if (!decision.needed) {
+    return decision;
+  }
+
+  const emailPart = decision.currentEmail ? ` <${decision.currentEmail}>` : "";
+  const raw = await p.text({
+    message: `Current Codex auth${emailPart} is not saved. Name it (empty = ${decision.suggestedName})`,
+    placeholder: decision.suggestedName,
+    validate: (value) => {
+      const next = String(value || "").trim();
+      if (!next) {
+        return undefined;
+      }
+      if (readAccounts().some((entry) => entry.name === next)) {
+        return "Account name already exists";
+      }
+      return undefined;
+    },
+  });
+  if (p.isCancel(raw)) {
+    p.log.info("Skipped saving current Codex auth.");
+    return { ...decision, skipped: true };
+  }
+  const name = String(raw || "").trim() || decision.suggestedName;
+  p.log.success(opSave(name));
+  return { ...decision, saved: true, name };
+}
+
+async function performAccountAddition(p) {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "cdx-add-account-"));
+  try {
+    const launchSpec = getCodexLaunchSpec(["-c", 'cli_auth_credentials_store="file"', "login"]);
+    if (!launchSpec.command) {
+      p.log.error("Codex binary not found. Set CDX_CODEX_BIN to the codex executable.");
+      return { added: false, reason: "no_binary" };
+    }
+
+    p.log.message("Opening Codex login in your browser...");
+    const exitCode = await new Promise((resolve) => {
+      const child = spawn(launchSpec.command, launchSpec.args, {
+        env: { ...process.env, CODEX_HOME: tempHome },
+        stdio: "inherit",
+      });
+      child.on("exit", (code) => resolve(typeof code === "number" ? code : 1));
+      child.on("error", () => resolve(-1));
+    });
+
+    try {
+      if (process.stdin && typeof process.stdin.setRawMode === "function" && process.stdin.isTTY) {
+        process.stdin.setRawMode(false);
+      }
+    } catch (_) {
+      // best-effort cleanup of any raw mode the child may have left behind
+    }
+
+    const newAuthPath = path.join(tempHome, "auth.json");
+    if (exitCode !== 0) {
+      if (exitCode === -1) {
+        p.log.error("Failed to launch codex for login.");
+        return { added: false, reason: "launch_error" };
+      }
+      p.log.warn(`Codex login exited with code ${exitCode}; no account saved.`);
+      return { added: false, reason: "login_failed" };
+    }
+    if (!isRegularFile(newAuthPath)) {
+      p.log.warn("Codex login finished but no auth file was produced; no account saved.");
+      return { added: false, reason: "no_auth_produced" };
+    }
+
+    const suggested = getFirstAvailableNumericAccountName(readAccounts());
+    const raw = await p.text({
+      message: `Name for the new account (empty = ${suggested})`,
+      placeholder: suggested,
+      validate: (value) => {
+        const next = String(value || "").trim();
+        if (!next) {
+          return undefined;
+        }
+        if (readAccounts().some((entry) => entry.name === next)) {
+          return "Account name already exists";
+        }
+        return undefined;
+      },
+    });
+    if (p.isCancel(raw)) {
+      p.log.info("Add cancelled.");
+      return { added: false, reason: "name_cancelled" };
+    }
+    const name = String(raw || "").trim() || suggested;
+
+    const snapshotDir = path.join(CDX_DIR, "auth");
+    const snapshotPath = path.join(snapshotDir, `${name}.auth.json`);
+    fs.mkdirSync(snapshotDir, { recursive: true });
+    fs.copyFileSync(newAuthPath, snapshotPath);
+    try {
+      fs.chmodSync(snapshotPath, 0o600);
+    } catch (_) {
+      // chmod unsupported on this platform
+    }
+
+    const accounts = readAccounts();
+    writeAccounts(upsertAccount(accounts, name, snapshotPath));
+    p.log.success(`Added account '${name}'.`);
+    return { added: true, name };
+  } finally {
+    try {
+      fs.rmSync(tempHome, { recursive: true, force: true });
+    } catch (_) {
+      // temp cleanup is best-effort
+    }
+  }
+}
+
+async function performAccountCleanup(p, { entries, cacheFreshness, activeName }) {
+  const online = await isOnline();
+  const health = readAccountHealth();
+  const decision = decideAccountCleanups({
+    entries,
+    cacheFreshness,
+    health,
+    activeName,
+    isOnline: online,
+    threshold: DEFAULT_CLEANUP_THRESHOLD,
+  });
+
+  if (decision.skipped) {
+    return { deletedNames: new Set(), skipped: true, reason: decision.reason };
+  }
+
+  const updatedHealth = { ...health };
+  for (const [name, update] of Object.entries(decision.healthUpdates)) {
+    updatedHealth[name] = { ...(updatedHealth[name] || {}), ...update };
+  }
+
+  const deletedNames = new Set();
+  for (const name of decision.toDelete) {
+    const stillPresent = findAccount(readAccounts(), name);
+    if (!stillPresent) {
+      delete updatedHealth[name];
+      continue;
+    }
+    try {
+      opRemove(name);
+      deletedNames.add(name);
+      delete updatedHealth[name];
+      if (p && p.log && typeof p.log.warn === "function") {
+        p.log.warn(
+          `Auto-removed stale account '${name}' after ${DEFAULT_CLEANUP_THRESHOLD} unresponsive checks (WiFi ok, other accounts responding).`,
+        );
+      }
+    } catch (_) {
+      // leave health entry intact so the next run can retry the removal
+    }
+  }
+
+  try {
+    writeAccountHealth(updatedHealth);
+  } catch (_) {
+    // persistence is best-effort; counters simply won't carry over
+  }
+
+  return { deletedNames, skipped: false, reason: "" };
 }
 
 function buildDepletedWarningMessage(name, status) {
@@ -2053,6 +2276,31 @@ async function loadPrompts() {
   }
 }
 
+async function loadClackCore() {
+  try {
+    return await import("@clack/core");
+  } catch (err) {
+    die(
+      `failed to load @clack/core (${err.message}). Install dependencies and try again.`,
+    );
+  }
+}
+
+const CLACK_STYLE_MAP = {
+  cyan: "boldCyan",
+  gray: "dim",
+  dim: "dim",
+  strikethrough: "dim",
+};
+
+function clackStyle(kind, text) {
+  const mapped = CLACK_STYLE_MAP[kind] || null;
+  if (!mapped) {
+    return text;
+  }
+  return colorize(text, mapped);
+}
+
 function requireTTY() {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     die("interactive terminal required. Run `cdx` in a TTY.");
@@ -2074,49 +2322,258 @@ async function promptValue(p, promise) {
   return value;
 }
 
-async function chooseAccount(p, message, opts = {}) {
-  const accounts = readAccounts();
-  if (accounts.length === 0) {
-    p.log.warn("No accounts configured.");
-    return "";
-  }
+const WIFI_STATUS_CACHE_TTL_MS = 10_000;
+let WIFI_STATUS_CACHE = { value: null, checkedAt: 0 };
 
-  const selectionData = opts.liveRateLimits
-    ? await loadSwitchAccountSelection(p, accounts, getActive(), opts.disabledName)
-    : {
-        options: toAccountOptions(accounts, getActive(), opts.disabledName),
-        recommendedValue: "",
-      };
-  const initialValue = opts.liveRateLimits
-    ? selectionData.recommendedValue || opts.initialValue
-    : opts.initialValue;
-  let nextInitialValue = initialValue;
+async function checkWifiStatus(now = Date.now) {
+  const currentTime = typeof now === "function" ? now() : now;
+  if (
+    WIFI_STATUS_CACHE.value !== null
+    && currentTime - WIFI_STATUS_CACHE.checkedAt < WIFI_STATUS_CACHE_TTL_MS
+  ) {
+    return WIFI_STATUS_CACHE.value;
+  }
+  const online = await isOnline({ timeoutMs: 1500 });
+  WIFI_STATUS_CACHE = { value: online, checkedAt: currentTime };
+  return online;
+}
+
+function resetWifiStatusCacheForTests() {
+  WIFI_STATUS_CACHE = { value: null, checkedAt: 0 };
+}
+
+function formatMainMenuMessage(activeName, online) {
+  const activePart = activeName ? `active: ${activeName}` : "no active account";
+  const wifiLabel = online
+    ? colorize("wifi ok", "boldGreen")
+    : colorize("wifi down", "boldRed");
+  return `Choose an action (${activePart} · ${wifiLabel})`;
+}
+
+function getManualActionOptions() {
+  return [
+    { value: "smart", label: "Smart switch", hint: "Use the healthiest account now" },
+    { value: "switch", label: "Account list", hint: "Enter activates, Space adds, Tab renames, Del removes" },
+    { value: "add", label: "Add account", hint: "Log in via browser to add a new account" },
+    { value: "settings", label: "CDX settings", hint: "Configure wrapper defaults" },
+    { value: "exit", label: "Exit" },
+  ];
+}
+
+const ACCESS_MODE_LABELS = {
+  "read-only": "Read Only",
+  "default": "Default",
+  "full-access": "Full Access",
+};
+
+const ACCESS_MODE_FLAGS = {
+  "read-only": ["--sandbox", "read-only", "--ask-for-approval", "never"],
+  "default": [],
+  "full-access": ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+};
+
+function getAccessModeLabel(accessMode) {
+  return ACCESS_MODE_LABELS[accessMode] || ACCESS_MODE_LABELS.default;
+}
+
+function getSettingsMenuOptions(settings = {}) {
+  const mode = settings && settings.accessMode ? settings.accessMode : "default";
+  return [
+    {
+      value: "access-mode",
+      label: "Access mode",
+      hint: getAccessModeLabel(mode),
+    },
+    { value: "back", label: "Back" },
+  ];
+}
+
+function getAccessModeOptions() {
+  return [
+    { value: "read-only", label: "Read Only" },
+    { value: "default", label: "Default" },
+    { value: "full-access", label: "Full Access" },
+  ];
+}
+
+function getAccessModeInitialValue(settings = {}) {
+  const mode = settings && typeof settings.accessMode === "string" ? settings.accessMode : "";
+  return ACCESS_MODE_LABELS[mode] ? mode : "default";
+}
+
+function hasExplicitAccessFlags(args = []) {
+  const values = Array.isArray(args) ? args : [];
+  for (let index = 0; index < values.length; index += 1) {
+    const current = values[index];
+    if (typeof current !== "string") {
+      continue;
+    }
+    if (
+      current === "-a" ||
+      current === "--ask-for-approval" ||
+      /^-a(?:=.+|.+)$/.test(current) ||
+      /^--ask-for-approval=.+$/.test(current) ||
+      current === "-s" ||
+      current === "--sandbox" ||
+      /^-s.+$/.test(current) ||
+      /^--sandbox=.+$/.test(current)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function applySavedAccessMode({ forwardedArgs, settings }) {
+  const args = Array.isArray(forwardedArgs) ? [...forwardedArgs] : [];
+  const mode = settings && typeof settings.accessMode === "string" ? settings.accessMode : "";
+  const injection = ACCESS_MODE_FLAGS[mode];
+  if (!injection || injection.length === 0) {
+    return args;
+  }
+  if (hasExplicitAccessFlags(args)) {
+    return args;
+  }
+  return [...injection, ...args];
+}
+
+const ADD_ACCOUNT_SENTINEL = "__cdx_add_account__";
+
+async function runAccountListPicker(p) {
+  const clackCore = await loadClackCore();
 
   while (true) {
-    const selection = await promptValue(
-      p,
-      p.select({
-        message,
-        options: selectionData.options,
-        initialValue: nextInitialValue,
-      }),
-    );
-
-    if (!opts.liveRateLimits) {
-      return selection;
+    const accounts = readAccounts();
+    if (accounts.length === 0) {
+      p.log.warn("No accounts configured.");
+      return "continue";
     }
 
-    const entry = selectionData.entriesByName.get(selection);
-    if (!entry || !statusHasDepletedLimit(entry.status)) {
-      return selection;
+    const activeName = getActive();
+    const { entries: keptEntries } = await fetchEntriesWithCleanup(p, accounts, activeName);
+    if (keptEntries.length === 0) {
+      p.log.warn("No accounts configured.");
+      return "continue";
+    }
+    const sortedEntries = sortEntriesByFiveHour(keptEntries);
+    const selection = buildSwitchAccountSelection(sortedEntries, activeName, "");
+
+    const addOption = {
+      value: ADD_ACCOUNT_SENTINEL,
+      label: "+ Add account",
+      hint: "Log in via browser and save as a new profile",
+    };
+    const listOptions = [addOption, ...selection.options];
+    const initialValue = selection.options[0] ? selection.options[0].value : ADD_ACCOUNT_SENTINEL;
+
+    const result = await runAccountListPrompt({
+      clackCore,
+      addSentinel: ADD_ACCOUNT_SENTINEL,
+      message: activeName ? `Account list (active: ${activeName})` : "Account list",
+      hint: "↑↓ navigate   ·   Enter activate   ·   Space add   ·   Tab rename   ·   Del remove   ·   Esc back",
+      options: listOptions,
+      initialValue,
+      style: clackStyle,
+    });
+
+    if (result.action === "cancel") {
+      return "continue";
     }
 
-    const confirmed = await confirmDepletedSelection(p, selection, entry.status);
-    if (confirmed) {
-      return selection;
+    if (result.action === "add") {
+      await performAccountAddition(p);
+      continue;
     }
 
-    nextInitialValue = selectionData.recommendedValue || selection;
+    if (result.action === "rename") {
+      if (!result.value || result.value === ADD_ACCOUNT_SENTINEL) {
+        continue;
+      }
+      const currentAccounts = readAccounts();
+      let raw;
+      try {
+        raw = await promptValue(
+          p,
+          p.text({
+            message: `Rename '${result.value}' to`,
+            placeholder: result.value,
+            validate: (value) => {
+              const next = String(value || "").trim();
+              if (!next) {
+                return undefined;
+              }
+              if (next !== result.value && currentAccounts.some((existing) => existing.name === next)) {
+                return "Account name already exists";
+              }
+              return undefined;
+            },
+          }),
+        );
+      } catch (err) {
+        if (err instanceof PromptCancelledError) {
+          continue;
+        }
+        throw err;
+      }
+      const newName = String(raw || "").trim();
+      if (!newName || newName === result.value) {
+        p.log.info("Rename cancelled.");
+        continue;
+      }
+      p.log.success(opRename(result.value, newName));
+      continue;
+    }
+
+    if (result.action === "delete") {
+      if (!result.value || result.value === ADD_ACCOUNT_SENTINEL) {
+        continue;
+      }
+      let ok;
+      try {
+        ok = await promptValue(
+          p,
+          p.confirm({
+            message: `Remove '${result.value}'?`,
+            initialValue: false,
+          }),
+        );
+      } catch (err) {
+        if (err instanceof PromptCancelledError) {
+          continue;
+        }
+        throw err;
+      }
+      if (!ok) {
+        p.log.info("Remove cancelled.");
+        continue;
+      }
+      p.log.success(opRemove(result.value));
+      continue;
+    }
+
+    if (result.action === "select") {
+      if (result.value === ADD_ACCOUNT_SENTINEL) {
+        await performAccountAddition(p);
+        continue;
+      }
+      const entry = selection.entriesByName.get(result.value);
+      if (entry && statusHasDepletedLimit(entry.status)) {
+        let confirmed;
+        try {
+          confirmed = await confirmDepletedSelection(p, result.value, entry.status);
+        } catch (err) {
+          if (err instanceof PromptCancelledError) {
+            continue;
+          }
+          throw err;
+        }
+        if (!confirmed) {
+          continue;
+        }
+      }
+      p.log.success(opUse(result.value));
+      return "continue";
+    }
   }
 }
 
@@ -2137,6 +2594,8 @@ async function runInteractive(migration) {
     }
   }
 
+  await promptCurrentAuthRegistrationIfNeeded(p);
+
   while (true) {
     const repair = repairAccountsStateOnDisk();
     const repairSummary = formatRepairSummary(repair);
@@ -2145,24 +2604,12 @@ async function runInteractive(migration) {
     }
 
     const active = getActive();
+    const online = await checkWifiStatus();
     const action = await promptValue(
       p,
       p.select({
-        message: active ? `Choose an action (active: ${active})` : "Choose an action",
-        options: [
-          { value: "smart", label: "Smart switch", hint: "Use the healthiest account now" },
-          { value: "use", label: "Use account", hint: "Set active account" },
-          { value: "switch", label: "Switch account", hint: "Interactive account picker" },
-          { value: "save", label: "Save current auth as account" },
-          { value: "add", label: "Add account from auth file" },
-          { value: "pin", label: "Pin or unpin account" },
-          { value: "exclude", label: "Exclude or include account" },
-          { value: "rename", label: "Rename account" },
-          { value: "swap", label: "Swap account order" },
-          { value: "remove", label: "Remove account" },
-          { value: "list", label: "List accounts" },
-          { value: "exit", label: "Exit" },
-        ],
+        message: formatMainMenuMessage(active, online),
+        options: getManualActionOptions(),
       }),
     );
 
@@ -2171,230 +2618,133 @@ async function runInteractive(migration) {
       return;
     }
 
-    if (action === "list") {
-      displayAccountList(p);
-      continue;
-    }
+    if (action === "settings") {
+      const currentSettings = readCdxSettings();
+      const settingAction = await promptValue(
+        p,
+        p.select({
+          message: "CDX settings",
+          options: getSettingsMenuOptions(currentSettings),
+        }),
+      );
 
-    if (action === "use") {
-      const name = await chooseAccount(p, "Use which account?");
-      if (!name) {
+      if (settingAction === "back") {
         continue;
       }
-      p.log.success(opUse(name));
+
+      const accessMode = await promptValue(
+        p,
+        p.select({
+          message: "Default access mode",
+          initialValue: getAccessModeInitialValue(currentSettings),
+          options: getAccessModeOptions(),
+        }),
+      );
+
+      writeCdxSettings({
+        settings: {
+          ...currentSettings,
+          accessMode,
+        },
+      });
+      p.log.success(`Saved access mode '${getAccessModeLabel(accessMode)}'.`);
       continue;
     }
 
     if (action === "switch") {
-      const accounts = readAccounts();
-      if (accounts.length === 0) {
-        p.log.warn("No accounts configured.");
-        continue;
-      }
-
-      const activeName = getActive();
-      const currentIndex = accounts.findIndex((entry) => entry.name === activeName);
-      const next = currentIndex < 0 ? accounts[0].name : accounts[(currentIndex + 1) % accounts.length].name;
-      const name = await chooseAccount(p, "Switch to which account?", {
-        initialValue: next,
-        liveRateLimits: true,
-      });
-      if (!name) {
-        continue;
-      }
-      p.log.success(opUse(name));
-      continue;
-    }
-
-    if (action === "smart") {
-      const accounts = readAccounts();
-      if (accounts.length === 0) {
-        p.log.warn("No accounts configured.");
-        continue;
-      }
-
-      const activeName = getActive();
-      const selection = await loadSwitchAccountSelection(p, accounts, activeName, "");
-      const decision = getSmartSwitchDecisionFromSelection(selection, activeName);
-      if (!decision.ok) {
-        const failureMessage = getSmartSwitchFailureMessage(decision);
-        if (decision.reason === "all_exhausted" || decision.reason === "all_unavailable_or_exhausted") {
-          p.log.error(failureMessage);
-        } else {
-          p.log.warn(failureMessage);
-        }
-        continue;
-      }
-
-      const targetName = decision.to || activeName;
-      const entry = targetName ? selection.entriesByName.get(targetName) : null;
-      if (entry && statusNeedsHardWarning(entry.status)) {
-        const confirmed = await confirmDepletedSelection(p, targetName, entry.status);
-        if (!confirmed) {
-          p.log.info("Smart switch cancelled.");
-          continue;
-        }
-      }
-
-      if (decision.alreadyOptimal) {
-        const currentEntry = selection.entriesByName.get(activeName);
-        const lowCreditsMessage = currentEntry && statusHasLowCredits(currentEntry.status)
-          ? ` (low credits: ${getCreditBalanceLabel(currentEntry.status)})`
-          : "";
-        p.outro(`Already using smart account '${activeName}'${lowCreditsMessage}.`);
+      const browseDone = await runAccountListPicker(p);
+      if (browseDone === "exit") {
         return;
       }
-
-      if (entry && statusHasLowCredits(entry.status)) {
-        p.log.warn(
-          `Smart switch picked '${targetName}' with low credits (${getCreditBalanceLabel(entry.status)}).`,
-        );
-      }
-      p.outro(opUse(targetName));
-      return;
-    }
-
-    if (action === "save") {
-      const name = await promptValue(
-        p,
-        p.text({
-          message: "Save current auth as",
-          placeholder: "work",
-          validate: (value) => (String(value || "").trim() ? undefined : "Name is required"),
-        }),
-      );
-      const trimmed = String(name).trim();
-      const exists = !!findAccount(readAccounts(), trimmed);
-      if (exists) {
-        const overwrite = await promptValue(
-          p,
-          p.confirm({
-            message: `Account '${trimmed}' exists. Overwrite?`,
-            initialValue: false,
-          }),
-        );
-        if (!overwrite) {
-          p.log.info("Save cancelled.");
-          continue;
-        }
-      }
-      p.log.success(opSave(trimmed));
       continue;
     }
 
     if (action === "add") {
-      const name = await promptValue(
-        p,
-        p.text({
-          message: "Account name",
-          placeholder: "personal",
-          validate: (value) => (String(value || "").trim() ? undefined : "Name is required"),
-        }),
-      );
-
-      const authPath = await promptValue(
-        p,
-        p.path({
-          message: "Path to auth.json",
-          placeholder: path.join(CODEX_HOME_DIR, "auth.json"),
-          validate: (value) => {
-            const candidate = path.resolve(String(value || ""));
-            return isRegularFile(candidate) ? undefined : "File not found";
-          },
-        }),
-      );
-
-      p.log.success(opAdd(String(name).trim(), String(authPath)));
+      await performAccountAddition(p);
+      const browseDone = await runAccountListPicker(p);
+      if (browseDone === "exit") {
+        return;
+      }
       continue;
     }
 
-    if (action === "pin") {
-      const name = await chooseAccount(p, "Pin or unpin which account?");
-      if (!name) {
-        continue;
-      }
-      const account = findAccount(readAccounts(), name);
-      p.log.success(opSetPinned(name, !(account && account.pinned === true)));
-      continue;
-    }
+    if (action === "smart") {
+      let smartDone = false;
+      while (!smartDone) {
+        const smartAccounts = readAccounts();
+        if (smartAccounts.length === 0) {
+          p.log.warn("No accounts configured. Opening Codex login to add one.");
+          const addResult = await performAccountAddition(p);
+          if (!addResult.added) {
+            smartDone = true;
+          }
+          continue;
+        }
 
-    if (action === "exclude") {
-      const name = await chooseAccount(p, "Exclude or include which account?");
-      if (!name) {
-        continue;
-      }
-      const account = findAccount(readAccounts(), name);
-      p.log.success(
-        opSetExcludedFromRecommendation(name, !(account && account.excludedFromRecommendation === true)),
-      );
-      continue;
-    }
+        const activeName = getActive();
+        const { entries: keptEntries } = await fetchEntriesWithCleanup(p, smartAccounts, activeName);
+        if (keptEntries.length === 0) {
+          p.log.warn("No accounts available after cleanup. Opening Codex login to add one.");
+          const addResult = await performAccountAddition(p);
+          if (!addResult.added) {
+            smartDone = true;
+          }
+          continue;
+        }
 
-    if (action === "rename") {
-      const oldName = await chooseAccount(p, "Rename which account?");
-      if (!oldName) {
-        continue;
-      }
-      const accounts = readAccounts();
-      const newName = await promptValue(
-        p,
-        p.text({
-          message: `New name for '${oldName}'`,
-          placeholder: oldName,
-          validate: (value) => {
-            const next = String(value || "").trim();
-            if (!next) {
-              return "Name is required";
+        const sortedEntries = sortEntriesByFiveHour(keptEntries);
+        const selection = buildSwitchAccountSelection(sortedEntries, activeName, "");
+        const decision = getSmartSwitchDecisionFromSelection(selection, activeName);
+        if (!decision.ok) {
+          const failureMessage = getSmartSwitchFailureMessage(decision);
+          const isExhausted = decision.reason === "all_exhausted"
+            || decision.reason === "all_unavailable_or_exhausted"
+            || decision.reason === "no_recommendation";
+          if (isExhausted) {
+            p.log.error(failureMessage);
+            p.log.info("Opening Codex login to add a fresh account.");
+            const addResult = await performAccountAddition(p);
+            if (!addResult.added) {
+              smartDone = true;
             }
-            if (next !== oldName && accounts.some((entry) => entry.name === next)) {
-              return "Account name already exists";
-            }
-            return undefined;
-          },
-        }),
-      );
-      p.log.success(opRename(oldName, String(newName).trim()));
+            continue;
+          }
+          p.log.warn(failureMessage);
+          smartDone = true;
+          continue;
+        }
+
+        const targetName = decision.to || activeName;
+        const entry = targetName ? selection.entriesByName.get(targetName) : null;
+        if (entry && statusNeedsHardWarning(entry.status)) {
+          const confirmed = await confirmDepletedSelection(p, targetName, entry.status);
+          if (!confirmed) {
+            p.log.info("Smart switch cancelled.");
+            smartDone = true;
+            continue;
+          }
+        }
+
+        if (decision.alreadyOptimal) {
+          const currentEntry = selection.entriesByName.get(activeName);
+          const lowCreditsMessage = currentEntry && statusHasLowCredits(currentEntry.status)
+            ? ` (low credits: ${getCreditBalanceLabel(currentEntry.status)})`
+            : "";
+          p.outro(`Already using smart account '${activeName}'${lowCreditsMessage}.`);
+          return;
+        }
+
+        if (entry && statusHasLowCredits(entry.status)) {
+          p.log.warn(
+            `Smart switch picked '${targetName}' with low credits (${getCreditBalanceLabel(entry.status)}).`,
+          );
+        }
+        p.outro(opUse(targetName));
+        return;
+      }
       continue;
     }
 
-    if (action === "swap") {
-      if (readAccounts().length < 2) {
-        p.log.warn("Need at least 2 accounts to swap.");
-        continue;
-      }
-      const first = await chooseAccount(p, "First account to swap");
-      if (!first) {
-        continue;
-      }
-      const second = await chooseAccount(p, "Second account to swap", {
-        disabledName: first,
-      });
-      if (!second) {
-        continue;
-      }
-      p.log.success(opSwap(first, second));
-      continue;
-    }
-
-    if (action === "remove") {
-      const name = await chooseAccount(p, "Remove which account?");
-      if (!name) {
-        continue;
-      }
-      const ok = await promptValue(
-        p,
-        p.confirm({
-          message: `Remove '${name}'?`,
-          initialValue: false,
-        }),
-      );
-      if (!ok) {
-        p.log.info("Remove cancelled.");
-        continue;
-      }
-      p.log.success(opRemove(name));
-      continue;
-    }
   }
 }
 
@@ -2436,14 +2786,28 @@ async function main() {
     return;
   }
 
+  const settings = readCdxSettings();
+  const wrapperArgs = applySavedAccessMode({
+    forwardedArgs: mode.forwardedArgs,
+    settings,
+  });
+
   await runCodexWrapper({
-    argv: mode.forwardedArgs,
+    argv: wrapperArgs,
     mainImpl: require("./ccx.js")._internalMain,
   });
 }
 
 module.exports = {
   _internal: {
+    resolveCdxDir,
+    getManualActionOptions,
+    getSettingsMenuOptions,
+    getAccessModeOptions,
+    getAccessModeInitialValue,
+    getAccessModeLabel,
+    hasExplicitAccessFlags,
+    applySavedAccessMode,
     ensureState,
     migrateLegacyAccountsOnce,
     parseLegacyAccountsTsv,
@@ -2463,9 +2827,6 @@ module.exports = {
     decodeJwtPayload,
     getAccountMetadata,
     getAccountEmail,
-    getAccountPlanType,
-    accountDisplayName,
-    formatAccountNameWithEmail,
     getRateLimitWindowLabel,
     formatResetAt,
     createRateLimitWindowSummary,
@@ -2494,7 +2855,21 @@ module.exports = {
     runSmartSwitchOperation,
     opSave,
     opUse,
+    opRemove,
+    opRename,
+    runAccountListPicker,
+    performAccountCleanup,
+    performAccountAddition,
+    fetchEntriesWithCleanup,
+    formatMainMenuMessage,
+    checkWifiStatus,
+    resetWifiStatusCacheForTests,
+    evaluateCurrentAuthRegistration,
+    promptCurrentAuthRegistrationIfNeeded,
+    sortEntriesByFiveHour,
+    getFirstAvailableNumericAccountName,
     formatRateLimitHint,
+    formatFiveHourInline,
     buildSwitchAccountLabel,
     buildSwitchAccountHint,
     buildSwitchAccountOptions,
