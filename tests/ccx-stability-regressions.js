@@ -1,0 +1,1598 @@
+#!/usr/bin/env node
+"use strict";
+
+const assert = require("node:assert/strict");
+const { resolvePendingPrompt } = require("../lib/ccx/prompt-state");
+const { createOutputPipeline } = require("../lib/ccx/output-pipeline");
+const { resolveResumeVerificationOutcome } = require("../lib/ccx/resume-verification");
+const { formatStartupBanner } = require("../lib/ccx/startup-ui");
+const {
+  formatSwitchingBanner,
+  formatDecisionBanner,
+  formatFailureBanner,
+  formatInfoBanner,
+} = require("../lib/ccx/status-ui");
+const {
+  applyInputChunk,
+  getForwardingChunks,
+} = require("../lib/ccx/input-buffer");
+
+const pendingRuns = [];
+
+function run(name, fn) {
+  pendingRuns.push(Promise.resolve().then(fn).then(() => {
+    process.stdout.write(`ok - ${name}\n`);
+  }).catch((err) => {
+    process.stderr.write(`not ok - ${name}\n${err.stack || err.message}\n`);
+    process.exitCode = 1;
+    throw err;
+  }));
+}
+
+run("startup banner renders a large green ASCII CDX header", () => {
+  const banner = formatStartupBanner();
+
+  assert.equal(
+    banner,
+    [
+      "\u001b[1;32m  _____   _____  __   __\u001b[0m",
+      "\u001b[1;32m / ____| |  __ \\\\ \\ \\ / /\u001b[0m",
+      "\u001b[1;32m| |      | |  | | \\ V / \u001b[0m",
+      "\u001b[1;32m| |      | |  | |  > <  \u001b[0m",
+      "\u001b[1;32m| |____  | |__| | / . \\\\\u001b[0m",
+      "\u001b[1;32m \\_____| |_____/ /_/ \\_\\\\" + "\u001b[0m",
+    ].join("\r\n"),
+  );
+});
+
+run("wrapper status banners use the green CDX wrapper theme", () => {
+  assert.match(formatSwitchingBanner(), /^\u001b\[1;32m\[CDX\] SWITCHING ACCOUNT\.\.\.\u001b\[0m$/);
+  assert.match(
+    formatDecisionBanner({ ok: true, switched: true, from: "1", to: "2" }),
+    /^\u001b\[1;32m\[CDX\] SWITCHED '1' -> '2'\. Reopening session\.\.\.\u001b\[0m$/,
+  );
+  assert.match(
+    formatFailureBanner("All eligible accounts are exhausted right now."),
+    /^\u001b\[1;32m\[CDX\] All eligible accounts are exhausted right now\.\u001b\[0m$/,
+  );
+  assert.match(
+    formatInfoBanner("Warning: smart switch selected a low-credit account \(0 CR\)\."),
+    /^\u001b\[1;32m\[CDX\] Warning: smart switch selected a low-credit account \(0 CR\)\.\u001b\[0m$/,
+  );
+});
+
+run("approval ui does not become a pending prompt", () => {
+  const prompt = resolvePendingPrompt(
+    "",
+    [
+      "header",
+      "\u203a leggi il progetto",
+      "",
+      "Allow command execution?",
+      "  Enter = approve",
+      "  Esc = deny",
+    ].join("\n"),
+  );
+  assert.equal(prompt, "");
+});
+
+run("visible multiline prompt survives footer lines but not approval ui", () => {
+  assert.equal(
+    resolvePendingPrompt(
+      "",
+      [
+        "header",
+        "\u203a leggi il progetto",
+        "  su piu righe",
+        "  gpt-5.4 xhigh \u00b7 ~\\Documents\\repo",
+      ].join("\n"),
+    ),
+    "leggi il progetto\n  su piu righe",
+  );
+});
+
+run("visible multiline prompt with footer and approval ui does not become a pending prompt", () => {
+  assert.equal(
+    resolvePendingPrompt(
+      "",
+      [
+        "header",
+        "\u203a leggi il progetto",
+        "  su piu righe",
+        "  gpt-5.4 xhigh \u00b7 ~\\Documents\\repo",
+        "",
+        "Allow command execution?",
+        "  Enter = approve",
+        "  Esc = deny",
+      ].join("\n"),
+    ),
+    "",
+  );
+});
+
+run("visible multiline prompt with blank tail does not become a pending prompt", () => {
+  assert.equal(
+    resolvePendingPrompt(
+      "",
+      [
+        "header",
+        "\u203a leggi il progetto",
+        "  su piu righe",
+        "",
+      ].join("\n"),
+    ),
+    "",
+  );
+});
+
+run("visible multiline prompt survives bare-cr footer lines", () => {
+  assert.equal(
+    resolvePendingPrompt(
+      "",
+      [
+        "header",
+        "\u203a leggi il progetto",
+        "  su piu righe",
+        "  gpt-5.4 xhigh \u00b7 ~\\Documents\\repo",
+      ].join("\r"),
+    ),
+    "leggi il progetto\n  su piu righe",
+  );
+});
+
+run("partial footer tails do not become a pending prompt", () => {
+  assert.equal(
+    resolvePendingPrompt(
+      "",
+      [
+        "header",
+        "\u203a leggi il progetto",
+        "  su piu righe",
+        "  gpt-5.4",
+      ].join("\n"),
+    ),
+    "",
+  );
+});
+
+run("generic indented trailing output does not become a pending prompt", () => {
+  assert.equal(
+    resolvePendingPrompt(
+      "",
+      [
+        "header",
+        "\u203a leggi il progetto",
+        "  su piu righe",
+        "  assistant output",
+      ].join("\n"),
+    ),
+    "",
+  );
+});
+
+run("transparent output lane passes normal chunks through immediately", () => {
+  const pipeline = createOutputPipeline();
+  assert.equal(pipeline.transform("assistant partial chunk"), "assistant partial chunk");
+});
+
+run("live output pipeline is pure pass-through in minimal mode", () => {
+  const pipeline = createOutputPipeline();
+
+  assert.equal(pipeline.transform("partial assistant chunk"), "partial assistant chunk");
+  assert.equal(pipeline.flush(), "");
+});
+
+run("minimal wrapper no longer imports prompt restore helpers in the autoswitch path", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  assert.doesNotMatch(source, /createPrefillController/);
+  assert.doesNotMatch(source, /formatHighlightedUserPrompt/);
+});
+
+run("strict autoswitch resumes through the orchestrator without prompt options", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  assert.match(
+    source,
+    /createSwitchOrchestrator\(\{[\s\S]*resumeSession:\s*async\s*\(resumeSessionId\)\s*=>\s*\{[\s\S]*await launchCodex\(\[\.\.\.accessModeArgs, "resume", resumeSessionId\]\);\s*\}/,
+  );
+  assert.doesNotMatch(source, /prefillText:/);
+  assert.doesNotMatch(source, /autoSubmitPrefill:/);
+});
+
+run("footer-like lines stay transparent without decoration", () => {
+  const pipeline = createOutputPipeline();
+
+  assert.equal(pipeline.transform("  gpt-5.4 xhigh \u00b7 ~\\Documents\\repo\r\n"), "  gpt-5.4 xhigh \u00b7 ~\\Documents\\repo\r\n");
+  assert.equal(pipeline.flush(), "");
+});
+
+run("split footer-like chunks stay transparent", () => {
+  const pipeline = createOutputPipeline();
+
+  assert.equal(pipeline.transform("  gpt-5.4"), "  gpt-5.4");
+  assert.equal(pipeline.transform(" xhigh \u00b7 ~\\repo\r\n"), " xhigh \u00b7 ~\\repo\r\n");
+  assert.equal(pipeline.flush(), "");
+});
+
+run("footer-like tails do not buffer for decoration", () => {
+  const pipeline = createOutputPipeline();
+
+  assert.equal(pipeline.transform("  gpt-5.4 xhigh \u00b7 ~\\repo"), "  gpt-5.4 xhigh \u00b7 ~\\repo");
+  assert.equal(pipeline.flush(), "");
+});
+
+run("generic indented path lines stay transparent", () => {
+  const pipeline = createOutputPipeline();
+
+  assert.equal(pipeline.transform("  2026 build - /tmp foo\r\n"), "  2026 build - /tmp foo\r\n");
+  assert.equal(pipeline.transform("  7 job - C:\\temp file\r\n"), "  7 job - C:\\temp file\r\n");
+  assert.equal(pipeline.flush(), "");
+});
+
+run("observer emits exhaustion only from structured session state", async () => {
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
+  let latestState = null;
+  const events = [];
+
+  const observer = createSessionObserver({
+    readSessionState: () => latestState,
+    onUsageLimitExceeded: (event) => events.push(event),
+    intervalMs: 5,
+  });
+
+  observer.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(events.length, 0);
+
+  latestState = {
+    latestError: {
+      code: "usage_limit_exceeded",
+      message: "You've hit your usage limit.",
+      timestamp: "2026-04-16T12:00:00.000Z",
+    },
+    latestUserMessage: "leggi il progetto",
+  };
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  observer.stop();
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].prompt, "leggi il progetto");
+  assert.equal(events[0].sessionState.latestUserMessage, "leggi il progetto");
+});
+
+run("observer emits exhaustion from message-text-only usage-limit state", async () => {
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
+  let latestState = null;
+  const events = [];
+
+  const observer = createSessionObserver({
+    readSessionState: () => latestState,
+    onUsageLimitExceeded: (event) => events.push(event),
+    intervalMs: 5,
+  });
+
+  observer.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  latestState = {
+    latestError: {
+      message: "You have hit your usage limit.",
+    },
+    latestUserMessage: "leggi il progetto",
+  };
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  observer.stop();
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].prompt, "leggi il progetto");
+  assert.equal(events[0].sessionState.latestError.message, "You have hit your usage limit.");
+});
+
+run("observer ignores non-exhausted structured session state until a structured exhaustion arrives", async () => {
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
+  const structuredStates = [
+    null,
+    {},
+    {
+      latestUserMessage: "stato strutturato",
+    },
+    {
+      latestError: {
+        code: "usage_limit_exceeded",
+        message: "You've hit your usage limit.",
+        timestamp: "2026-04-16T12:00:00.000Z",
+      },
+      latestUserMessage: "stato strutturato",
+    },
+  ];
+  let readCount = 0;
+  const observedStates = [];
+  const events = [];
+
+  const observer = createSessionObserver({
+    readSessionState: () => structuredStates[Math.min(readCount++, structuredStates.length - 1)],
+    onSessionStateObserved: (sessionState) => observedStates.push(sessionState),
+    onUsageLimitExceeded: (event) => events.push(event),
+    intervalMs: 5,
+  });
+
+  observer.start();
+  const deadline = Date.now() + 250;
+  while (Date.now() < deadline && events.length === 0) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  observer.stop();
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].prompt, "stato strutturato");
+  assert.deepEqual(observedStates.slice(0, 3), [
+    {},
+    {
+      latestUserMessage: "stato strutturato",
+    },
+    {
+      latestError: {
+        code: "usage_limit_exceeded",
+        message: "You've hit your usage limit.",
+        timestamp: "2026-04-16T12:00:00.000Z",
+      },
+      latestUserMessage: "stato strutturato",
+    },
+  ]);
+});
+
+run("observer does not use rendered output as a core trigger", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  assert.doesNotMatch(source, /hasOutputUsageLimitMessage/);
+  assert.doesNotMatch(source, /readOutputUsageLimitBridge/);
+});
+
+run("session state usage-limit detection falls back to historical message text", () => {
+  const { isSessionStateUsageLimitExceeded } = require("../lib/ccx/session-log");
+
+  assert.equal(
+    isSessionStateUsageLimitExceeded({
+      latestError: {
+        code: "different_error",
+        message: "You've hit your usage limit. Try again later.",
+      },
+    }),
+    true,
+  );
+});
+
+run("win32 arrow chunks do not mutate the local draft buffer", () => {
+  const arrowUpChunk = "\u001b[0;0;27;1;0;1_\u001b[0;0;91;1;0;1_\u001b[0;0;65;1;0;1_";
+  assert.deepEqual(
+    applyInputChunk("draft", arrowUpChunk),
+    {
+      draft: "draft",
+      submitted: false,
+      changed: false,
+    },
+  );
+});
+
+run("win32 arrow chunks forward vt sequences to the pty", () => {
+  const arrowUpChunk = "\u001b[0;0;27;1;0;1_\u001b[0;0;91;1;0;1_\u001b[0;0;65;1;0;1_";
+  assert.deepEqual(getForwardingChunks(arrowUpChunk), ["\u001b[A"]);
+});
+
+run("wrapper input state preserves draft and forwards vt arrows", () => {
+  const { _internal } = require("../bin/ccx.js");
+  const state = {
+    draftBuffer: "draft",
+    lastSubmittedPrompt: "",
+    outputBuffer: "buffer",
+    outputTransformer: null,
+  };
+  const arrowUpChunk = "\u001b[0;0;27;1;0;1_\u001b[0;0;91;1;0;1_\u001b[0;0;65;1;0;1_";
+
+  const result = _internal.processInputChunkForState(state, arrowUpChunk);
+
+  assert.equal(state.draftBuffer, "draft");
+  assert.equal(result.submittedPrompt, "");
+  assert.deepEqual(result.forwardingChunks, ["\u001b[A"]);
+});
+
+run("win32 arrow chunks with virtual-key-only encoding forward vt sequences", () => {
+  // Real Windows Terminal Win32 input mode for arrow keys uses vkey=<VK_*> and unicode=0.
+  // Up=38, Down=40, Right=39, Left=37, Home=36, End=35, PageUp=33, PageDown=34.
+  const arrowUpChunk = "[38;0;0;1;0;1_";
+  const arrowDownChunk = "[40;0;0;1;0;1_";
+  const arrowLeftChunk = "[37;0;0;1;0;1_";
+  const arrowRightChunk = "[39;0;0;1;0;1_";
+  const homeChunk = "[36;0;0;1;0;1_";
+  const endChunk = "[35;0;0;1;0;1_";
+  const pageUpChunk = "[33;0;0;1;0;1_";
+  const pageDownChunk = "[34;0;0;1;0;1_";
+
+  assert.deepEqual(getForwardingChunks(arrowUpChunk), ["[A"]);
+  assert.deepEqual(getForwardingChunks(arrowDownChunk), ["[B"]);
+  assert.deepEqual(getForwardingChunks(arrowRightChunk), ["[C"]);
+  assert.deepEqual(getForwardingChunks(arrowLeftChunk), ["[D"]);
+  assert.deepEqual(getForwardingChunks(homeChunk), ["[H"]);
+  assert.deepEqual(getForwardingChunks(endChunk), ["[F"]);
+  assert.deepEqual(getForwardingChunks(pageUpChunk), ["[5~"]);
+  assert.deepEqual(getForwardingChunks(pageDownChunk), ["[6~"]);
+});
+
+run("win32 virtual-key-only arrows do not mutate the draft buffer", () => {
+  const arrowUpChunk = "[38;0;0;1;0;1_";
+  assert.deepEqual(
+    applyInputChunk("draft", arrowUpChunk),
+    {
+      draft: "draft",
+      submitted: false,
+      changed: false,
+    },
+  );
+});
+
+run("helper imports do not require node-pty until runtime launch", () => {
+  const Module = require("node:module");
+  const ccxPath = require.resolve("../bin/ccx.js");
+  const originalLoad = Module._load;
+
+  delete require.cache[ccxPath];
+  Module._load = function patchedLoad(request, parent, isMain) {
+    if (request === "node-pty") {
+      throw new Error("node-pty import blocked");
+    }
+    return originalLoad.apply(this, arguments);
+  };
+
+  try {
+    const ccx = require("../bin/ccx.js");
+    assert.equal(typeof ccx._internal.processInputChunkForState, "function");
+  } finally {
+    Module._load = originalLoad;
+    delete require.cache[ccxPath];
+  }
+});
+
+run("delayed new-session discovery preserves the initial post-launch tail for prompt recovery", async () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
+  const { _internal } = require("../bin/ccx.js");
+
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccx-stability-delayed-discovery-"));
+  const sessionFile = path.join(tempRoot, "2026", "04", "17", "rollout.jsonl");
+  fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+  fs.writeFileSync(
+    sessionFile,
+    [
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:00.000Z",
+        type: "session_meta",
+        payload: {
+          id: "sess-delayed-discovery",
+          timestamp: "2026-04-17T10:00:00.000Z",
+          cwd: "C:\\repo",
+          originator: "codex-tui",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:01.000Z",
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: "retry now",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:02.000Z",
+        type: "event_msg",
+        payload: {
+          type: "error",
+          message: "You've hit your usage limit. Try again later.",
+          codex_error_info: "usage_limit_exceeded",
+        },
+      }),
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const state = {
+    sessionFilePath: "",
+    sessionStateBaselineSize: 0,
+    sessionStateBaselinePendingDiscovery: false,
+    switching: false,
+    shuttingDown: false,
+    lastSubmittedPrompt: "",
+  };
+  const events = [];
+
+  assert.equal(typeof _internal.captureSessionStateBaselineForState, "function");
+  assert.equal(typeof _internal.captureDeferredSessionStateBaselineForState, "function");
+  assert.equal(typeof _internal.readCurrentSessionStateForState, "function");
+  assert.equal(typeof _internal.syncObservedSessionStateForState, "function");
+  assert.equal(typeof _internal.shouldHandleUsageLimitEventForState, "function");
+
+  _internal.captureSessionStateBaselineForState(state, {
+    preserveDiscoveredTail: true,
+  });
+  assert.equal(state.sessionStateBaselineSize, 0);
+  assert.equal(state.sessionStateBaselinePendingDiscovery, true);
+
+  const observer = createSessionObserver({
+    readSessionState: () => _internal.readCurrentSessionStateForState(state),
+    onSessionStateObserved: (sessionState) => {
+      _internal.syncObservedSessionStateForState(state, sessionState);
+    },
+    onUsageLimitExceeded: (event) => events.push(event),
+    intervalMs: 5,
+  });
+
+  observer.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(events.length, 0);
+
+  const discoveredBaselineSize = fs.statSync(sessionFile).size;
+  _internal.applyObservedSessionIdentityForState(state, {
+    sessionId: "sess-delayed-discovery",
+    sessionFilePath: sessionFile,
+    preserveDiscoveredTail: true,
+  });
+
+  assert.equal(discoveredBaselineSize > 0, true);
+  assert.equal(state.sessionStateBaselineSize, 0);
+  assert.equal(state.sessionStateBaselinePendingDiscovery, false);
+
+  const deadline = Date.now() + 200;
+  while (Date.now() < deadline && events.length === 0) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  observer.stop();
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].prompt, "retry now");
+  assert.equal(events[0].sessionState.latestError.code, "usage_limit_exceeded");
+  assert.equal(state.lastSubmittedPrompt, "retry now");
+  assert.equal(_internal.shouldHandleUsageLimitEventForState(state, events[0]), true);
+});
+
+run("resume baseline still ignores historical pre-launch session lines", async () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
+  const { _internal } = require("../bin/ccx.js");
+
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccx-stability-resume-baseline-"));
+  const sessionFile = path.join(tempRoot, "2026", "04", "17", "resume.jsonl");
+  fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+  fs.writeFileSync(
+    sessionFile,
+    [
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:00.000Z",
+        type: "session_meta",
+        payload: {
+          id: "sess-resume-baseline",
+          timestamp: "2026-04-17T10:00:00.000Z",
+          cwd: "C:\\repo",
+          originator: "codex-tui",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:01.000Z",
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: "historical prompt",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:02.000Z",
+        type: "event_msg",
+        payload: {
+          type: "error",
+          message: "You've hit your usage limit. Try again later.",
+          codex_error_info: "usage_limit_exceeded",
+        },
+      }),
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const state = {
+    sessionFilePath: sessionFile,
+    sessionStateBaselineSize: 0,
+    sessionStateBaselinePendingDiscovery: false,
+  };
+  const events = [];
+
+  _internal.captureSessionStateBaselineForState(state);
+  const historicalBaselineSize = fs.statSync(sessionFile).size;
+  assert.equal(state.sessionStateBaselineSize, historicalBaselineSize);
+  assert.equal(state.sessionStateBaselinePendingDiscovery, false);
+
+  const observer = createSessionObserver({
+    readSessionState: () => _internal.readCurrentSessionStateForState(state),
+    onUsageLimitExceeded: (event) => events.push(event),
+    intervalMs: 5,
+  });
+
+  observer.start();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(events.length, 0);
+
+  fs.appendFileSync(
+    sessionFile,
+    [
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:03.000Z",
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: "fresh prompt",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:04.000Z",
+        type: "event_msg",
+        payload: {
+          type: "error",
+          message: "You've hit your usage limit. Try again later.",
+          codex_error_info: "usage_limit_exceeded",
+        },
+      }),
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const deadline = Date.now() + 200;
+  while (Date.now() < deadline && events.length === 0) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  observer.stop();
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].prompt, "fresh prompt");
+});
+
+run("new-session discovery preserves the post-launch tail", () => {
+  const { createSessionIdentityTracker } = require("../lib/ccx/session-identity");
+  const tracker = createSessionIdentityTracker();
+
+  tracker.markAwaitingDiscovery();
+  tracker.attachDiscoveredSession({
+    sessionId: "sess-new",
+    sessionFilePath: "C:\\tmp\\new.jsonl",
+    preserveDiscoveredTail: true,
+  });
+
+  assert.equal(tracker.getState().sessionStateBaselineSize, 0);
+});
+
+run("resumed sessions baseline at eof instead of replaying historical lines", () => {
+  const { createSessionIdentityTracker } = require("../lib/ccx/session-identity");
+  const tracker = createSessionIdentityTracker();
+
+  tracker.attachResumedSession({
+    sessionId: "sess-resume",
+    sessionFilePath: "C:\\tmp\\resume.jsonl",
+    currentSize: 512,
+  });
+
+  assert.equal(tracker.getState().sessionStateBaselineSize, 512);
+});
+
+run("resume verification stays pending until the resumed session produces stable output", () => {
+  assert.equal(
+    resolveResumeVerificationOutcome({
+      expectedSessionId: "sess-1",
+      confirmedSessionId: "",
+      outputSeen: false,
+      firstOutputAtMs: 0,
+      nowMs: 1_000,
+      processAlive: true,
+      stableDelayMs: 250,
+    }),
+    null,
+  );
+
+  assert.equal(
+    resolveResumeVerificationOutcome({
+      expectedSessionId: "sess-1",
+      confirmedSessionId: "",
+      outputSeen: true,
+      firstOutputAtMs: 900,
+      nowMs: 1_000,
+      processAlive: true,
+      stableDelayMs: 250,
+    }),
+    null,
+  );
+});
+
+run("resume verification accepts stable resumed output even without an echoed session id", () => {
+  assert.deepEqual(
+    resolveResumeVerificationOutcome({
+      expectedSessionId: "sess-1",
+      confirmedSessionId: "",
+      outputSeen: true,
+      firstOutputAtMs: 700,
+      nowMs: 1_000,
+      processAlive: true,
+      stableDelayMs: 250,
+    }),
+    {
+      matched: true,
+      source: "output",
+    },
+  );
+});
+
+run("resume verification rejects a mismatched echoed session id", () => {
+  assert.deepEqual(
+    resolveResumeVerificationOutcome({
+      expectedSessionId: "sess-1",
+      confirmedSessionId: "sess-2",
+      outputSeen: true,
+      firstOutputAtMs: 700,
+      nowMs: 1_000,
+      processAlive: true,
+      stableDelayMs: 250,
+    }),
+    {
+      matched: false,
+      source: "output+sessionId",
+    },
+  );
+});
+
+run("strict autoswitch refuses to proceed without canonical identity", async () => {
+  const { createSwitchOrchestrator } = require("../lib/ccx/switch-orchestrator");
+  const calls = [];
+  const orchestrator = createSwitchOrchestrator({
+    closeSession: async () => calls.push("close"),
+    runSmartSwitch: async () => ({ ok: true, from: "1", to: "2" }),
+    resumeSession: async () => calls.push("resume"),
+    verifyResumedSession: async () => true,
+  });
+
+  await assert.rejects(
+    () => orchestrator.handleExhaustion({ sessionId: "", sessionFilePath: "" }),
+    /canonical session identity/i,
+  );
+  assert.deepEqual(calls, []);
+});
+
+run("strict autoswitch errors when resumed session id does not match", async () => {
+  const { createSwitchOrchestrator } = require("../lib/ccx/switch-orchestrator");
+  const orchestrator = createSwitchOrchestrator({
+    closeSession: async () => {},
+    runSmartSwitch: async () => ({ ok: true, from: "1", to: "2" }),
+    resumeSession: async () => {},
+    verifyResumedSession: async () => false,
+  });
+
+  await assert.rejects(
+    () => orchestrator.handleExhaustion({ sessionId: "sess-1", sessionFilePath: "C:\\tmp\\sess-1.jsonl" }),
+    /same sessionid/i,
+  );
+});
+
+run("strict autoswitch path does not attempt fallback accounts", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  assert.doesNotMatch(source, /chooseFallbackAccount/);
+  assert.doesNotMatch(source, /shouldAttemptFallbackAccount/);
+});
+
+run("minimal autoswitch path no longer restores prompts after exhaustion", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  assert.doesNotMatch(source, /prefillText:\s*canonicalPrompt/);
+  assert.doesNotMatch(source, /autoSubmitPrefill/);
+});
+
+run("resume branch preloads disk-verified sessionId and filePath for observer arming", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  const resumeBranchStart = source.indexOf("const resumeSessionIdArg = findResumeSessionIdArg(args);");
+  const resumeBranchEnd = source.indexOf("discoverSessionFile(", resumeBranchStart);
+  const resumeBranch = source.slice(resumeBranchStart, resumeBranchEnd);
+
+  assert.notEqual(resumeBranchStart, -1);
+  assert.notEqual(resumeBranchEnd, -1);
+  assert.match(resumeBranch, /sessionId:\s*resumedSession\.id/);
+  assert.match(resumeBranch, /sessionFilePath:\s*resumedSession\.filePath/);
+  assert.match(resumeBranch, /state\.resumeVerificationConfirmedSessionId\s*=\s*resumedSession\.id/);
+});
+
+run("findResumeSessionIdArg locates resume regardless of preceding approval flags", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.findResumeSessionIdArg, "function");
+  assert.equal(_internal.findResumeSessionIdArg(["resume", "abc"]), "abc");
+  assert.equal(_internal.findResumeSessionIdArg(["-a", "untrusted", "resume", "abc"]), "abc");
+  assert.equal(_internal.findResumeSessionIdArg(["--ask-for-approval", "on-request", "resume", "xyz"]), "xyz");
+  assert.equal(_internal.findResumeSessionIdArg(["-c", "k=v", "-m", "gpt-5", "resume", "id42"]), "id42");
+  assert.equal(_internal.findResumeSessionIdArg(["-a=untrusted", "resume", "q"]), "q");
+  assert.equal(_internal.findResumeSessionIdArg(["-a", "resume"]), "", "resume as flag value should not be treated as subcommand");
+  assert.equal(_internal.findResumeSessionIdArg([]), "");
+  assert.equal(_internal.findResumeSessionIdArg(["exec", "something"]), "");
+});
+
+run("strict autoswitch clears transient draft state before resuming", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  assert.match(source, /state\.draftBuffer\s*=\s*"";/);
+});
+
+run("extractAccessModeArgs collects saved and explicit access flags", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.extractAccessModeArgs, "function");
+  assert.deepEqual(
+    _internal.extractAccessModeArgs(["--sandbox", "read-only", "--ask-for-approval", "never", "resume", "--last"]),
+    ["--sandbox", "read-only", "--ask-for-approval", "never"],
+  );
+  assert.deepEqual(
+    _internal.extractAccessModeArgs(["--sandbox", "danger-full-access", "--ask-for-approval", "never"]),
+    ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+  );
+  assert.deepEqual(
+    _internal.extractAccessModeArgs(["-s", "workspace-write", "resume", "abc"]),
+    ["-s", "workspace-write"],
+  );
+  assert.deepEqual(
+    _internal.extractAccessModeArgs(["-sread-only", "-a", "untrusted", "resume", "id"]),
+    ["-sread-only", "-a", "untrusted"],
+  );
+  assert.deepEqual(
+    _internal.extractAccessModeArgs(["--sandbox=read-only", "--ask-for-approval=never", "resume", "x"]),
+    ["--sandbox=read-only", "--ask-for-approval=never"],
+  );
+  assert.deepEqual(
+    _internal.extractAccessModeArgs(["resume", "--last"]),
+    [],
+  );
+  assert.deepEqual(_internal.extractAccessModeArgs([]), []);
+  assert.deepEqual(_internal.extractAccessModeArgs(null), []);
+});
+
+run("autoswitch resume preserves saved access mode flags on the new Codex process", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  // Wrapper state must capture access flags from the initial launch so the
+  // resumed session inherits the same sandbox/approval policy. Without this,
+  // a chat reloaded after a rate-limit autoswitch ignores the user's
+  // configured access mode and starts Codex with default permissions.
+  assert.match(source, /initialAccessModeArgs:\s*\[\]/);
+  assert.match(source, /state\.initialAccessModeArgs\s*=\s*extractAccessModeArgs\(forwardedArgs\)/);
+  assert.match(
+    source,
+    /resumeSession:\s*async\s*\(resumeSessionId\)\s*=>\s*\{[\s\S]*accessModeArgs[\s\S]*state\.initialAccessModeArgs[\s\S]*launchCodex\(\[\.\.\.accessModeArgs, "resume", resumeSessionId\]\)/,
+  );
+});
+
+run("hasTuiUsageLimitError matches the compact-task usage-limit line across wraps", () => {
+  const { hasTuiUsageLimitError } = require("../lib/ccx/session-log");
+
+  // Real sample: Codex prints this in the TUI when its background compact
+  // task hits the usage limit. It does NOT appear in the session JSONL, so
+  // the normal session-state detector cannot see it; the wrapper must
+  // match it directly on the rendered output stream.
+  const wrapped = [
+    "■ Error running remote compact task: You've hit your usage limit. Upgrade to Pro",
+    "(https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or",
+    "try again at Apr 25th, 2026 2:27 AM.",
+  ].join("\n");
+  assert.equal(hasTuiUsageLimitError(wrapped), true);
+
+  const tight = "Error running remote compact task: usage limit reached.";
+  assert.equal(hasTuiUsageLimitError(tight), true);
+
+  // Rate-limit phrasing variant.
+  const rateLimit = "Error running remote compact task: rate-limited by upstream.";
+  assert.equal(hasTuiUsageLimitError(rateLimit), true);
+
+  // Unrelated errors must NOT match.
+  assert.equal(hasTuiUsageLimitError("Error running remote compact task: network timeout."), false);
+  assert.equal(hasTuiUsageLimitError("You've hit your usage limit."), false);
+  assert.equal(hasTuiUsageLimitError(""), false);
+  assert.equal(hasTuiUsageLimitError(null), false);
+
+  // Anchor distance guard: if "usage limit" is far away from the compact
+  // task marker (unrelated line), don't conflate.
+  const faraway = "Error running remote compact task: done.\n" + "x".repeat(500) + "\nusage limit mentioned elsewhere";
+  assert.equal(hasTuiUsageLimitError(faraway), false);
+});
+
+run("wrapper wires TUI usage-limit detector into the Codex onData stream", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  // Codex surfaces certain usage-limit errors only in the rendered TUI
+  // stream (e.g. "Error running remote compact task"), so the wrapper has
+  // to scan the output buffer and trigger autoswitch from there when the
+  // session JSONL and live rate-limit probe both miss the signal.
+  assert.match(source, /hasTuiUsageLimitError,/);
+  assert.match(source, /tuiUsageLimitPatternMatched:\s*false/);
+  assert.match(source, /state\.tuiUsageLimitPatternMatched\s*=\s*false/);
+  assert.match(
+    source,
+    /child\.onData\([\s\S]*?hasTuiUsageLimitError\(state\.outputBuffer\)[\s\S]*?handleTuiUsageLimitDetection\(\)/,
+  );
+  assert.match(source, /function handleTuiUsageLimitDetection/);
+  assert.match(source, /source:\s*"tui"/);
+  assert.match(source, /"tui_usage_limit_detected"/);
+});
+
+run("TUI usage-limit handler honors the skip guard when identity is missing", () => {
+  const source = require("node:fs").readFileSync("bin/ccx.js", "utf8");
+
+  // The handler must defer to shouldHandleUsageLimitEventForState like the
+  // session/live paths; otherwise a rogue TUI match during startup (before
+  // canonical identity is known) would trigger a blind autoswitch.
+  assert.match(
+    source,
+    /function handleTuiUsageLimitDetection[\s\S]*?shouldHandleUsageLimitEventForState\(state, pendingPrompt\)[\s\S]*?usage_watch_skipped/,
+  );
+});
+
+run("tracker can accept an output-derived session id without losing pending discovery", () => {
+  const { createSessionIdentityTracker } = require("../lib/ccx/session-identity");
+  const tracker = createSessionIdentityTracker();
+
+  tracker.markAwaitingDiscovery();
+  tracker.setSessionId("sess-from-output");
+
+  assert.deepEqual(tracker.getState(), {
+    sessionId: "sess-from-output",
+    sessionFilePath: "",
+    sessionStateBaselineSize: 0,
+    sessionStateBaselinePendingDiscovery: true,
+  });
+});
+
+run("deferred baseline capture keys off tracker pending discovery instead of stale wrapper mirrors", () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const { createSessionIdentityTracker } = require("../lib/ccx/session-identity");
+  const { _internal } = require("../bin/ccx.js");
+
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccx-stability-canonical-pending-"));
+  const sessionFile = path.join(tempRoot, "canonical-pending.jsonl");
+  fs.writeFileSync(sessionFile, "", "utf8");
+
+  const tracker = createSessionIdentityTracker();
+  tracker.markAwaitingDiscovery();
+  tracker.setSessionId("sess-from-output");
+
+  const state = {
+    sessionId: "stale-wrapper-id",
+    sessionFilePath: sessionFile,
+    sessionStateBaselineSize: 0,
+    sessionStateBaselinePendingDiscovery: false,
+    sessionStatePreserveDiscoveredTail: true,
+    sessionIdentityTracker: tracker,
+  };
+
+  _internal.captureDeferredSessionStateBaselineForState(state);
+
+  assert.equal(state.sessionId, "sess-from-output");
+  assert.equal(state.sessionFilePath, sessionFile);
+  assert.equal(state.sessionStateBaselineSize, 0);
+  assert.equal(state.sessionStateBaselinePendingDiscovery, false);
+});
+
+run("observer arming uses canonical tracker identity instead of stale wrapper mirrors", () => {
+  const { createSessionIdentityTracker } = require("../lib/ccx/session-identity");
+  const { _internal } = require("../bin/ccx.js");
+  const tracker = createSessionIdentityTracker();
+
+  tracker.attachResumedSession({
+    sessionId: "sess-canonical",
+    sessionFilePath: "C:\\tmp\\canonical.jsonl",
+    currentSize: 128,
+  });
+
+  assert.equal(
+    _internal.shouldArmSessionObserverForState({
+      sessionId: "",
+      sessionFilePath: "",
+      sessionIdentityTracker: tracker,
+      switching: false,
+      shuttingDown: false,
+      lastSubmittedPrompt: "",
+    }),
+    true,
+  );
+});
+
+run("identity resolution prefers the canonical tracker over stale wrapper mirrors", () => {
+  const { createSessionIdentityTracker } = require("../lib/ccx/session-identity");
+  const { _internal } = require("../bin/ccx.js");
+  const tracker = createSessionIdentityTracker();
+
+  tracker.attachResumedSession({
+    sessionId: "sess-canonical",
+    sessionFilePath: "C:\\tmp\\canonical.jsonl",
+    currentSize: 128,
+  });
+
+  assert.deepEqual(
+    _internal.resolveSessionIdentityForState({
+      sessionId: "sess-stale",
+      sessionFilePath: "C:\\tmp\\stale.jsonl",
+      sessionIdentityTracker: tracker,
+    }),
+    {
+      sessionId: "sess-canonical",
+      sessionFilePath: "C:\\tmp\\canonical.jsonl",
+    },
+  );
+});
+
+run("sessionId-only corrections update the canonical tracker for an already-known path", () => {
+  const { createSessionIdentityTracker } = require("../lib/ccx/session-identity");
+  const { _internal } = require("../bin/ccx.js");
+  const tracker = createSessionIdentityTracker();
+
+  tracker.attachResumedSession({
+    sessionId: "sess-original",
+    sessionFilePath: "C:\\tmp\\known.jsonl",
+    currentSize: 128,
+  });
+
+  const state = {
+    sessionId: "sess-stale-wrapper",
+    sessionFilePath: "C:\\tmp\\known.jsonl",
+    sessionStateBaselineSize: 128,
+    sessionStateBaselinePendingDiscovery: false,
+    sessionIdentityTracker: tracker,
+  };
+
+  _internal.applyObservedSessionIdentityForState(state, {
+    sessionId: "sess-corrected",
+    sessionFilePath: "C:\\tmp\\known.jsonl",
+  });
+
+  assert.deepEqual(_internal.resolveSessionIdentityForState(state), {
+    sessionId: "sess-corrected",
+    sessionFilePath: "C:\\tmp\\known.jsonl",
+  });
+  assert.equal(state.sessionId, "sess-corrected");
+  assert.equal(state.sessionFilePath, "C:\\tmp\\known.jsonl");
+});
+
+run("input submit clears stale canonical prompt cache without submit-time watcher mutations", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.processInputChunkForState, "function");
+
+  const state = {
+    draftBuffer: "leggi il progetto",
+    lastSubmittedPrompt: "prompt from observer",
+    outputBuffer: "stale output",
+    sessionStateBaselineSize: 321,
+    sessionStateBaselinePendingDiscovery: true,
+    sessionObserver: { active: true },
+    outputTransformer: null,
+  };
+
+  const result = _internal.processInputChunkForState(state, "\r");
+
+  assert.equal(result.submittedPrompt, "leggi il progetto");
+  assert.deepEqual(result.forwardingChunks, ["\r"]);
+  assert.equal(state.draftBuffer, "");
+  assert.equal(state.outputBuffer, "");
+  assert.equal(state.lastSubmittedPrompt, "");
+  assert.equal(state.sessionStateBaselineSize, 321);
+  assert.equal(state.sessionStateBaselinePendingDiscovery, true);
+  assert.deepEqual(state.sessionObserver, { active: true });
+});
+
+run("empty Enter with approval-style output does not become a prompt submit at the wrapper boundary", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.processInputChunkForState, "function");
+
+  const state = {
+    draftBuffer: "",
+    lastSubmittedPrompt: "observer-owned prompt",
+    outputBuffer: [
+      "Allow command execution?",
+      "  Enter = approve",
+      "  Esc = deny",
+    ].join("\n"),
+    outputTransformer: null,
+  };
+
+  const result = _internal.processInputChunkForState(state, "\r");
+
+  assert.equal(result.submittedPrompt, "");
+  assert.deepEqual(result.forwardingChunks, ["\r"]);
+  assert.equal(state.draftBuffer, "");
+  assert.equal(state.outputBuffer, [
+    "Allow command execution?",
+    "  Enter = approve",
+    "  Esc = deny",
+  ].join("\n"));
+  assert.equal(state.lastSubmittedPrompt, "observer-owned prompt");
+});
+
+run("coalesced submit chunk preserves only the pre-submit prompt and keeps trailing draft bytes", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.processInputChunkForState, "function");
+
+  const state = {
+    draftBuffer: "",
+    lastSubmittedPrompt: "stale observer prompt",
+    outputBuffer: "stale output",
+    outputTransformer: null,
+  };
+
+  const result = _internal.processInputChunkForState(state, "hello\rworld");
+
+  assert.equal(result.submittedPrompt, "hello");
+  assert.deepEqual(result.forwardingChunks, ["hello\rworld"]);
+  assert.equal(state.draftBuffer, "world");
+  assert.equal(state.outputBuffer, "");
+  assert.equal(state.lastSubmittedPrompt, "");
+});
+
+run("coalesced repeated submit chunk submits the first prompt and leaves only post-final-submit draft state", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.processInputChunkForState, "function");
+
+  const state = {
+    draftBuffer: "",
+    lastSubmittedPrompt: "stale observer prompt",
+    outputBuffer: "stale output",
+    outputTransformer: null,
+  };
+
+  const result = _internal.processInputChunkForState(state, "hello\rworld\r");
+
+  assert.equal(result.submittedPrompt, "hello");
+  assert.deepEqual(result.forwardingChunks, ["hello\rworld\r"]);
+  assert.equal(state.draftBuffer, "");
+  assert.equal(state.outputBuffer, "");
+  assert.equal(state.lastSubmittedPrompt, "");
+});
+
+run("leading submit chunk keeps trailing draft bytes without inventing a submitted prompt", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.processInputChunkForState, "function");
+
+  const state = {
+    draftBuffer: "",
+    lastSubmittedPrompt: "observer-owned prompt",
+    outputBuffer: "approval-style output",
+    outputTransformer: null,
+  };
+
+  const result = _internal.processInputChunkForState(state, "\rworld");
+
+  assert.equal(result.submittedPrompt, "");
+  assert.deepEqual(result.forwardingChunks, ["\rworld"]);
+  assert.equal(state.draftBuffer, "world");
+  assert.equal(state.outputBuffer, "approval-style output");
+  assert.equal(state.lastSubmittedPrompt, "observer-owned prompt");
+});
+
+run("observer-owned prompt sync updates the canonical prompt cache", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.syncObservedSessionStateForState, "function");
+
+  const state = {
+    lastSubmittedPrompt: "",
+  };
+
+  _internal.syncObservedSessionStateForState(state, {
+    latestUserMessage: "prompt from session state",
+  });
+  assert.equal(state.lastSubmittedPrompt, "prompt from session state");
+
+  _internal.syncObservedSessionStateForState(state, {
+    latestError: {
+      code: "usage_limit_exceeded",
+    },
+  });
+  assert.equal(state.lastSubmittedPrompt, "prompt from session state");
+});
+
+run("session observer arming depends on session identity not submit-time prompt state", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.shouldArmSessionObserverForState, "function");
+
+  assert.equal(
+    _internal.shouldArmSessionObserverForState({
+      sessionId: "sess-1",
+      sessionFilePath: "",
+      lastSubmittedPrompt: "",
+    }),
+    true,
+  );
+  assert.equal(
+    _internal.shouldArmSessionObserverForState({
+      sessionId: "",
+      sessionFilePath: "C:\\Users\\filmd\\.codex\\sessions\\2026\\04\\17\\session.jsonl",
+      lastSubmittedPrompt: "",
+    }),
+    true,
+  );
+  assert.equal(
+    _internal.shouldArmSessionObserverForState({
+      sessionId: "",
+      sessionFilePath: "",
+      lastSubmittedPrompt: "submit-time prompt should not matter",
+    }),
+    false,
+  );
+});
+
+run("usage-limit handling waits until canonical session identity is available", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.shouldHandleUsageLimitEventForState, "function");
+  assert.equal(typeof _internal.syncObservedSessionStateForState, "function");
+
+  const earlyWindowState = {
+    switching: false,
+    shuttingDown: false,
+    sessionId: "sess-early-window",
+    sessionFilePath: "",
+    lastSubmittedPrompt: "",
+  };
+
+  assert.equal(
+    _internal.shouldHandleUsageLimitEventForState(earlyWindowState, {
+      prompt: "prompt from observer event",
+    }),
+    false,
+  );
+
+  _internal.syncObservedSessionStateForState(earlyWindowState, {
+    latestUserMessage: "prompt from observer cache",
+  });
+  assert.equal(
+    _internal.shouldHandleUsageLimitEventForState(earlyWindowState, {
+      prompt: "",
+    }),
+    false,
+  );
+
+  const sessionFile = "C:\\tmp\\recoverable-session.jsonl";
+
+  assert.equal(
+    _internal.shouldHandleUsageLimitEventForState({
+      switching: false,
+      shuttingDown: false,
+      sessionId: "sess-file-recovery",
+      sessionFilePath: sessionFile,
+      lastSubmittedPrompt: "",
+    }, {
+      prompt: "",
+    }),
+    true,
+  );
+  assert.equal(
+    _internal.shouldHandleUsageLimitEventForState({
+      switching: true,
+      shuttingDown: false,
+      sessionId: "sess-file-recovery",
+      sessionFilePath: sessionFile,
+      lastSubmittedPrompt: "",
+    }, {
+      prompt: "prompt from observer event",
+    }),
+    false,
+  );
+  assert.equal(
+    _internal.shouldHandleUsageLimitEventForState({
+      switching: false,
+      shuttingDown: true,
+      sessionId: "sess-file-recovery",
+      sessionFilePath: sessionFile,
+      lastSubmittedPrompt: "",
+    }, {
+      prompt: "prompt from observer event",
+    }),
+    false,
+  );
+});
+
+run("usage-limit prompt resolution prefers the observer event prompt over a stale session tail reread", () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.resolveUsageLimitPromptForState, "function");
+
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ccx-stability-prompt-resolution-"));
+  const sessionFile = path.join(tempRoot, "stale-session.jsonl");
+  fs.writeFileSync(
+    sessionFile,
+    [
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:00.000Z",
+        type: "session_meta",
+        payload: {
+          id: "sess-stale-prompt",
+          timestamp: "2026-04-17T10:00:00.000Z",
+          cwd: "C:\\repo",
+          originator: "codex-tui",
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-04-17T10:00:01.000Z",
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: "stale prompt from tail reread",
+        },
+      }),
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const state = {
+    sessionFilePath: sessionFile,
+    lastSubmittedPrompt: "prompt from observer cache",
+  };
+
+  assert.equal(
+    _internal.resolveUsageLimitPromptForState(state, {
+      prompt: "fresh prompt from observer event",
+    }),
+    "fresh prompt from observer event",
+  );
+  assert.equal(
+    _internal.resolveUsageLimitPromptForState(state, {
+      prompt: "",
+    }),
+    "prompt from observer cache",
+  );
+  assert.equal(
+    _internal.resolveUsageLimitPromptForState(
+      {
+        sessionFilePath: sessionFile,
+        lastSubmittedPrompt: "",
+      },
+      {
+        prompt: "",
+      },
+    ),
+    "",
+  );
+});
+
+run("post-switch resume releases switching before re-arming the observer", () => {
+  const { _internal } = require("../bin/ccx.js");
+
+  assert.equal(typeof _internal.releaseSwitchingStateForState, "function");
+  assert.equal(typeof _internal.shouldArmSessionObserverForState, "function");
+
+  const state = {
+    switching: true,
+    shuttingDown: false,
+    sessionId: "sess-rearm",
+    sessionFilePath: "",
+    sessionObserver: null,
+  };
+  let shouldArmDuringRelease = null;
+  let releaseCallbackCalls = 0;
+
+  _internal.releaseSwitchingStateForState(state, () => {
+    releaseCallbackCalls += 1;
+    shouldArmDuringRelease = _internal.shouldArmSessionObserverForState(state);
+  });
+
+  assert.equal(state.switching, false);
+  assert.equal(releaseCallbackCalls, 1);
+  assert.equal(shouldArmDuringRelease, true);
+});
+
+run("detector matches alternative rate-limit error codes mid-stream", () => {
+  const {
+    isSessionStateUsageLimitExceeded,
+    isUsageLimitErrorCode,
+  } = require("../lib/ccx/session-log");
+
+  assert.equal(isUsageLimitErrorCode("usage_limit_exceeded"), true);
+  assert.equal(isUsageLimitErrorCode("rate_limit_exceeded"), true);
+  assert.equal(isUsageLimitErrorCode("rate_limit_reached"), true);
+  assert.equal(isUsageLimitErrorCode("rate_limited"), true);
+  assert.equal(isUsageLimitErrorCode("quota_exceeded"), true);
+  assert.equal(isUsageLimitErrorCode("something_else"), false);
+
+  assert.equal(
+    isSessionStateUsageLimitExceeded({
+      latestError: { code: "rate_limit_reached", message: "", timestamp: "" },
+      rateLimits: null,
+      latestUserMessage: "",
+    }),
+    true,
+  );
+  assert.equal(
+    isSessionStateUsageLimitExceeded({
+      latestError: { code: "", message: "You've reached your 5-hour limit.", timestamp: "" },
+      rateLimits: null,
+      latestUserMessage: "",
+    }),
+    true,
+  );
+  assert.equal(
+    isSessionStateUsageLimitExceeded({
+      latestError: { code: "", message: "rate-limited for this request.", timestamp: "" },
+      rateLimits: null,
+      latestUserMessage: "",
+    }),
+    true,
+  );
+  assert.equal(
+    isSessionStateUsageLimitExceeded({
+      latestError: { code: "", message: "weekly limit reached.", timestamp: "" },
+      rateLimits: null,
+      latestUserMessage: "",
+    }),
+    true,
+  );
+  assert.equal(
+    isSessionStateUsageLimitExceeded({
+      latestError: { code: "other_error", message: "something unrelated happened.", timestamp: "" },
+      rateLimits: null,
+      latestUserMessage: "",
+    }),
+    false,
+  );
+});
+
+run("observer live fallback fires on exhausted live status and dedups session trigger", async () => {
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
+
+  const liveStatuses = [
+    {
+      available: true,
+      primary: { remainingPercent: 0, resetAtSeconds: 1_700_000_000 },
+      secondary: { remainingPercent: 50, resetAtSeconds: 1_700_100_000 },
+      credits: null,
+      planType: "plus",
+    },
+  ];
+  const debugEvents = [];
+  const usageEvents = [];
+
+  const observer = createSessionObserver({
+    readSessionState: () => null,
+    onSessionStateObserved: () => {},
+    onUsageLimitExceeded: (event) => {
+      usageEvents.push(event);
+    },
+    onDebug: (event, fields) => {
+      debugEvents.push({ event, fields });
+    },
+    intervalMs: 10,
+    getActiveAccountAuthPath: () => "C:/fake/account.auth.json",
+    fetchLiveRateLimitStatus: async () => liveStatuses.shift() || { available: false, errorCode: "unavailable" },
+    liveFallbackIntervalMs: 1_000,
+  });
+
+  observer.start();
+  await new Promise((resolve) => setTimeout(resolve, 1_200));
+  observer.stop();
+
+  assert.equal(usageEvents.length, 1, "should fire exactly once from the live fallback");
+  assert.equal(usageEvents[0].source, "live_fallback");
+  assert.equal(usageEvents[0].sessionState.rateLimits.primary.usedPercent, 100);
+
+  const kinds = debugEvents.map((entry) => entry.event);
+  assert.ok(kinds.includes("live_fallback_check"));
+  assert.ok(kinds.includes("live_fallback_exhausted"));
+  assert.ok(kinds.includes("usage_watch_fired"));
+});
+
+run("observer live fallback stays silent when live status is unavailable", async () => {
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
+
+  const usageEvents = [];
+  const observer = createSessionObserver({
+    readSessionState: () => null,
+    onUsageLimitExceeded: (event) => usageEvents.push(event),
+    intervalMs: 10,
+    getActiveAccountAuthPath: () => "C:/fake/account.auth.json",
+    fetchLiveRateLimitStatus: async () => ({ available: false, errorCode: "missing_rate_limits" }),
+    liveFallbackIntervalMs: 1_000,
+  });
+
+  observer.start();
+  await new Promise((resolve) => setTimeout(resolve, 1_200));
+  observer.stop();
+
+  assert.equal(usageEvents.length, 0);
+});
+
+run("observer live fallback disabled when interval is zero or hooks missing", async () => {
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
+
+  let liveCalls = 0;
+  const observer = createSessionObserver({
+    readSessionState: () => null,
+    onUsageLimitExceeded: () => {},
+    intervalMs: 10,
+    getActiveAccountAuthPath: () => "C:/fake/account.auth.json",
+    fetchLiveRateLimitStatus: async () => {
+      liveCalls += 1;
+      return { available: false };
+    },
+    liveFallbackIntervalMs: 0,
+  });
+
+  observer.start();
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  observer.stop();
+
+  assert.equal(liveCalls, 0, "live fallback should be disabled when interval is 0");
+});
+
+run("diagnoseUsageLimitSkipReason classifies why a usage-limit event is skipped", () => {
+  const { _internal } = require("../bin/ccx.js");
+  const diag = _internal.diagnoseUsageLimitSkipReason;
+
+  assert.equal(diag(null), "invalid_state");
+  assert.equal(diag({ shuttingDown: true }), "shutting_down");
+  assert.equal(diag({ switching: true }), "already_switching");
+  assert.equal(diag({ sessionId: "", sessionFilePath: "" }), "no_session_identity");
+  assert.equal(diag({ sessionId: "", sessionFilePath: "/tmp/foo.jsonl" }), "no_session_id");
+  assert.equal(diag({ sessionId: "abc", sessionFilePath: "" }), "no_session_file_path");
+  assert.equal(diag({ sessionId: "abc", sessionFilePath: "/tmp/foo.jsonl" }), "unknown");
+});
+
+run("observer emits a snapshot debug event when an unrecognized error appears", async () => {
+  const { createSessionObserver } = require("../lib/ccx/session-observer");
+
+  const debugEvents = [];
+  const states = [
+    {
+      latestError: { code: "weird_code", message: "something weird", timestamp: "2025-01-01T00:00:00Z" },
+      rateLimits: null,
+      latestUserMessage: "hi",
+    },
+  ];
+  const observer = createSessionObserver({
+    readSessionState: () => states.shift() || null,
+    onUsageLimitExceeded: () => {},
+    onDebug: (event, fields) => debugEvents.push({ event, fields }),
+    intervalMs: 20,
+  });
+
+  observer.start();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  observer.stop();
+
+  const snapshot = debugEvents.find((entry) => entry.event === "session_state_snapshot");
+  assert.ok(snapshot, "should emit session_state_snapshot when state changes");
+  assert.equal(snapshot.fields.triggered, false);
+  assert.equal(snapshot.fields.errorCode, "weird_code");
+});
+
+Promise.all(pendingRuns)
+  .then(() => {
+    process.stdout.write("all cdx stability regression tests passed\n");
+  })
+  .catch(() => {
+    process.exit(process.exitCode || 1);
+  });

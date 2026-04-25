@@ -1,23 +1,116 @@
 #!/usr/bin/env node
 "use strict";
 
+const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const CDX_DIR = process.env.CDX_DIR || path.join(os.homedir(), ".cdx");
+const { decideCdxMode } = require("../lib/cdx/dispatcher");
+const { runManualEntryPoint } = require("../lib/cdx/manual");
+const { readCdxSettings, writeCdxSettings } = require("../lib/cdx/settings");
+const { runCodexWrapper } = require("../lib/cdx/wrapper");
+const { runAccountListPrompt } = require("../lib/cdx/account-list-prompt");
+const {
+  findMatchingSavedAccount,
+  getFirstAvailableNumericAccountName,
+} = require("../lib/ccx/current-account");
+const {
+  DEFAULT_CLEANUP_THRESHOLD,
+  readAccountHealth,
+  writeAccountHealth,
+  decideAccountCleanups,
+} = require("../lib/cdx/account-health");
+const { isOnline } = require("../lib/cdx/connectivity");
+
+function resolveCdxDir(envValue = process.env.CDX_DIR) {
+  if (typeof envValue === "string") {
+    const trimmed = envValue.trim();
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+  return path.join(os.homedir(), ".cdx");
+}
+
+const CDX_DIR = resolveCdxDir();
 const ACCOUNTS_FILE = path.join(CDX_DIR, "accounts.json");
 const LEGACY_ACCOUNTS_FILE = path.join(CDX_DIR, "accounts.tsv");
 const MIGRATION_MARKER = path.join(CDX_DIR, ".migration_accounts_tsv_v1.done");
 const ACTIVE_FILE = path.join(CDX_DIR, "active");
 const CODEX_HOME_DIR = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const TARGET_AUTH = path.join(CODEX_HOME_DIR, "auth.json");
+const CODEX_BIN = process.env.CDX_CODEX_BIN || "codex";
+const CODEX_BIN_ARGS = parseJsonArrayEnv("CDX_CODEX_BIN_ARGS_JSON");
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
-const AUTH_EMAIL_CACHE = new Map();
+const AUTH_METADATA_CACHE = new Map();
+const LIVE_RATE_LIMIT_CACHE = new Map();
+const LIVE_RATE_LIMIT_TTL_MS = 45_000;
+const APP_SERVER_INITIALIZE_TIMEOUT_MS = 5_000;
+const APP_SERVER_ACCOUNT_READ_TIMEOUT_MS = 5_000;
+const APP_SERVER_RATE_LIMITS_TIMEOUT_MS = 10_000;
+const LIVE_RATE_LIMIT_CONCURRENCY = 2;
+const LOW_CREDITS_THRESHOLD = 10;
+const LIVE_RATE_LIMIT_TEMP_PREFIX = ".codex-rate-limit-home-";
+const LIVE_RATE_LIMIT_TEMP_ROOT = path.join(os.tmpdir(), "cdx-rate-limit-homes");
+let LIVE_RATE_LIMIT_FETCHER = null;
+let APP_SERVER_QUERY = null;
+let RESOLVED_CODEX_BINARY = null;
+const ANSI_RESET = "\x1b[0m";
+const ANSI = {
+  boldGreen: "\x1b[1;32m",
+  boldCyan: "\x1b[1;36m",
+  boldRed: "\x1b[1;31m",
+  boldYellow: "\x1b[1;33m",
+  dim: "\x1b[2m",
+};
+
+function parseJsonArrayEnv(name) {
+  const raw = process.env[name];
+  if (!raw) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((entry) => typeof entry === "string") : [];
+  } catch (_) {
+    return [];
+  }
+}
 
 function die(message) {
   process.stderr.write(`cdx: ${message}\n`);
   process.exit(1);
+}
+
+function normalizeAccountEntry(entry) {
+  if (!entry || typeof entry !== "object") {
+    return null;
+  }
+  if (typeof entry.name !== "string" || typeof entry.path !== "string") {
+    return null;
+  }
+
+  const name = entry.name.trim();
+  const accountPath = entry.path.trim();
+  if (!name || !accountPath) {
+    return null;
+  }
+
+  return {
+    name,
+    path: accountPath,
+    pinned: entry.pinned === true,
+    excludedFromRecommendation: entry.excludedFromRecommendation === true,
+  };
+}
+
+function isAccountEntryEqual(left, right) {
+  return !!left && !!right &&
+    left.name === right.name &&
+    left.path === right.path &&
+    left.pinned === right.pinned &&
+    left.excludedFromRecommendation === right.excludedFromRecommendation;
 }
 
 function ensureState() {
@@ -26,7 +119,8 @@ function ensureState() {
   if (!fs.existsSync(ACCOUNTS_FILE)) {
     fs.writeFileSync(ACCOUNTS_FILE, "[]\n", "utf8");
   }
-  return migration;
+  const repair = repairAccountsStateOnDisk();
+  return { ...migration, repair };
 }
 
 function writeMigrationMarker(extra = "") {
@@ -56,7 +150,12 @@ function parseLegacyAccountsTsv(filePath) {
     }
 
     const existing = accounts.findIndex((entry) => entry.name === name);
-    const next = { name, path: accountPath };
+    const next = {
+      name,
+      path: accountPath,
+      pinned: false,
+      excludedFromRecommendation: false,
+    };
     if (existing >= 0) {
       accounts[existing] = next;
     } else {
@@ -75,15 +174,8 @@ function readAccountsFromJson(filePath) {
   }
 
   return parsed
-    .filter(
-      (entry) =>
-        entry &&
-        typeof entry.name === "string" &&
-        typeof entry.path === "string" &&
-        entry.name.trim() &&
-        entry.path.trim(),
-    )
-    .map((entry) => ({ name: entry.name.trim(), path: entry.path.trim() }));
+    .map(normalizeAccountEntry)
+    .filter(Boolean);
 }
 
 function migrateLegacyAccountsOnce() {
@@ -146,17 +238,84 @@ function clearActive() {
   }
 }
 
+function getNextActiveAccount(accounts, previousActive = "") {
+  const preferred = previousActive ? accounts.find((entry) => entry.name === previousActive) : null;
+  if (preferred) {
+    return preferred;
+  }
+  return accounts[0] || null;
+}
+
+function repairAccountsState(accounts, activeName = "") {
+  const normalized = accounts.map((entry) => normalizeAccountEntry(entry)).filter(Boolean);
+  const valid = normalized.filter((entry) => isRegularFile(entry.path));
+  const removed = normalized.filter((entry) => !isRegularFile(entry.path));
+  const changed =
+    removed.length > 0 ||
+    normalized.length !== accounts.length ||
+    normalized.some((entry, index) => !isAccountEntryEqual(entry, accounts[index]));
+
+  const activeMissing = !!activeName && !valid.some((entry) => entry.name === activeName);
+  const nextActive = activeMissing ? getNextActiveAccount(valid, activeName) : null;
+
+  return {
+    accounts: valid,
+    removed,
+    changed,
+    activeChanged: activeMissing,
+    activeName: activeMissing ? (nextActive ? nextActive.name : "") : activeName,
+  };
+}
+
+function repairAccountsStateOnDisk() {
+  if (!fs.existsSync(ACCOUNTS_FILE)) {
+    return {
+      accounts: [],
+      removed: [],
+      changed: false,
+      activeChanged: false,
+      activeName: getActive(),
+    };
+  }
+
+  const parsed = readAccountsFromJson(ACCOUNTS_FILE);
+  const activeName = getActive();
+  const repair = repairAccountsState(parsed, activeName);
+  if (repair.changed) {
+    writeAccounts(repair.accounts);
+  }
+
+  if (repair.activeChanged) {
+    if (repair.activeName) {
+      setActive(repair.activeName);
+    } else {
+      clearActive();
+    }
+  }
+
+  return repair;
+}
+
 function upsertAccount(accounts, name, accountPath) {
   let found = false;
   const next = accounts.map((entry) => {
     if (entry.name === name) {
       found = true;
-      return { name, path: accountPath };
+      return {
+        ...entry,
+        name,
+        path: accountPath,
+      };
     }
     return entry;
   });
   if (!found) {
-    next.push({ name, path: accountPath });
+    next.push({
+      name,
+      path: accountPath,
+      pinned: false,
+      excludedFromRecommendation: false,
+    });
   }
   return next;
 }
@@ -230,6 +389,75 @@ function emailFromToken(tokenValue) {
   return "";
 }
 
+function normalizePlanType(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  return value.trim().toLowerCase();
+}
+
+function planTypeFromToken(tokenValue) {
+  const payload = decodeJwtPayload(tokenValue);
+  if (!payload) {
+    return "";
+  }
+
+  const candidateClaims = [
+    payload.chatgpt_plan_type,
+    payload.plan_type,
+    payload.planType,
+  ];
+  for (const claim of candidateClaims) {
+    const planType = normalizePlanType(claim);
+    if (planType) {
+      return planType;
+    }
+  }
+  return "";
+}
+
+function extractAccountIdFromObject(input) {
+  if (!input || typeof input !== "object") {
+    return "";
+  }
+
+  const stack = [input];
+  const seen = new Set();
+
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node || typeof node !== "object") {
+      continue;
+    }
+    if (seen.has(node)) {
+      continue;
+    }
+    seen.add(node);
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        stack.push(item);
+      }
+      continue;
+    }
+
+    for (const [key, value] of Object.entries(node)) {
+      if (typeof value === "string") {
+        if (/^(account_id|accountId)$/i.test(key)) {
+          const accountId = value.trim();
+          if (accountId) {
+            return accountId;
+          }
+        }
+      } else if (value && typeof value === "object") {
+        stack.push(value);
+      }
+    }
+  }
+
+  return "";
+}
+
 function extractEmailFromObject(input) {
   if (!input || typeof input !== "object") {
     return "";
@@ -286,39 +514,91 @@ function extractEmailFromObject(input) {
   return "";
 }
 
-function getAccountEmail(accountPath) {
+function extractPlanTypeFromObject(input) {
+  if (!input || typeof input !== "object") {
+    return "";
+  }
+
+  const stack = [input];
+  const seen = new Set();
+
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node || typeof node !== "object") {
+      continue;
+    }
+    if (seen.has(node)) {
+      continue;
+    }
+    seen.add(node);
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        stack.push(item);
+      }
+      continue;
+    }
+
+    for (const [key, value] of Object.entries(node)) {
+      if (typeof value === "string") {
+        if (/(chatgpt_plan_type|plan_type|planType)/i.test(key)) {
+          const planType = normalizePlanType(value);
+          if (planType) {
+            return planType;
+          }
+        }
+
+        if (/(token|id_token|access_token)/i.test(key)) {
+          const tokenPlanType = planTypeFromToken(value);
+          if (tokenPlanType) {
+            return tokenPlanType;
+          }
+        }
+      } else if (value && typeof value === "object") {
+        stack.push(value);
+      }
+    }
+  }
+
+  return "";
+}
+
+function getAccountMetadata(accountPath) {
   try {
     const stat = fs.statSync(accountPath);
     if (!stat.isFile()) {
-      AUTH_EMAIL_CACHE.delete(accountPath);
-      return "";
+      AUTH_METADATA_CACHE.delete(accountPath);
+      return { accountId: "", email: "", planType: "" };
     }
 
-    const cached = AUTH_EMAIL_CACHE.get(accountPath);
+    const cached = AUTH_METADATA_CACHE.get(accountPath);
     if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-      return cached.email;
+      return { accountId: cached.accountId, email: cached.email, planType: cached.planType };
     }
 
     const raw = fs.readFileSync(accountPath, "utf8");
     const parsed = JSON.parse(raw);
-    const email = extractEmailFromObject(parsed);
-    AUTH_EMAIL_CACHE.set(accountPath, { mtimeMs: stat.mtimeMs, size: stat.size, email });
-    return email;
+    const metadata = {
+      accountId: extractAccountIdFromObject(parsed),
+      email: extractEmailFromObject(parsed),
+      planType: extractPlanTypeFromObject(parsed),
+    };
+    AUTH_METADATA_CACHE.set(accountPath, {
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      accountId: metadata.accountId,
+      email: metadata.email,
+      planType: metadata.planType,
+    });
+    return metadata;
   } catch (_) {
-    AUTH_EMAIL_CACHE.delete(accountPath);
-    return "";
+    AUTH_METADATA_CACHE.delete(accountPath);
+    return { accountId: "", email: "", planType: "" };
   }
 }
 
-function accountDisplayName(account) {
-  const email = getAccountEmail(account.path);
-  if (!email) {
-    return account.name;
-  }
-  if (account.name.toLowerCase().includes(email.toLowerCase())) {
-    return account.name;
-  }
-  return `${account.name} <${email}>`;
+function getAccountEmail(accountPath) {
+  return getAccountMetadata(accountPath).email;
 }
 
 function applyAuthFile(sourceAuth) {
@@ -336,20 +616,6 @@ function applyAuthFile(sourceAuth) {
   } catch (_) {
     // Ignore chmod failures on non-POSIX systems.
   }
-}
-
-function opAdd(name, rawPath) {
-  const fullPath = path.resolve(rawPath);
-  if (!isRegularFile(fullPath)) {
-    die(`auth file not found: ${fullPath}`);
-  }
-
-  const accounts = readAccounts();
-  writeAccounts(upsertAccount(accounts, name, fullPath));
-  if (!getActive()) {
-    setActive(name);
-  }
-  return `Registered account '${name}' -> ${fullPath}`;
 }
 
 function opSave(name) {
@@ -412,29 +678,6 @@ function opRename(oldName, newName) {
   return `Renamed account '${oldName}' to '${newName}'`;
 }
 
-function opSwap(aName, bName) {
-  const accounts = readAccounts();
-  if (accounts.length < 2) {
-    die("need at least 2 configured accounts to swap");
-  }
-
-  const firstIndex = accounts.findIndex((entry) => entry.name === aName);
-  const secondIndex = accounts.findIndex((entry) => entry.name === bName);
-  if (firstIndex < 0 || secondIndex < 0) {
-    die("unknown account selected for swap");
-  }
-
-  if (firstIndex === secondIndex) {
-    return "Swap target is the same account; nothing changed.";
-  }
-
-  const firstName = accounts[firstIndex].name;
-  const secondName = accounts[secondIndex].name;
-  [accounts[firstIndex], accounts[secondIndex]] = [accounts[secondIndex], accounts[firstIndex]];
-  writeAccounts(accounts);
-  return `Swapped '${firstName}' with '${secondName}'`;
-}
-
 function opRemove(name) {
   const accounts = readAccounts();
   const removed = findAccount(accounts, name);
@@ -447,6 +690,21 @@ function opRemove(name) {
 
   if (isManagedSnapshot(removed.path) && isRegularFile(removed.path)) {
     fs.rmSync(removed.path, { force: true });
+  }
+
+  try {
+    pruneLiveRateLimitCache(removed.path);
+  } catch (_) {
+    // cache pruning is best-effort
+  }
+  try {
+    const health = readAccountHealth();
+    if (Object.prototype.hasOwnProperty.call(health, name)) {
+      delete health[name];
+      writeAccountHealth(health);
+    }
+  } catch (_) {
+    // health persistence is best-effort
   }
 
   const active = getActive();
@@ -465,36 +723,1547 @@ function opRemove(name) {
   return `Removed account '${name}'. Switched to '${next.name}'.`;
 }
 
-function toAccountOptions(accounts, activeName, disabledName) {
-  return accounts.map((account) => {
-    const hints = [];
-    if (account.name === activeName) {
-      hints.push("active");
-    }
-    hints.push(account.path);
+function opSetPinned(name, pinned) {
+  const accounts = readAccounts();
+  const index = accounts.findIndex((entry) => entry.name === name);
+  if (index < 0) {
+    die(`unknown account: ${name}`);
+  }
 
-    return {
-      value: account.name,
-      label: accountDisplayName(account),
-      hint: hints.join(" · "),
-      disabled: account.name === disabledName,
-    };
+  accounts[index] = {
+    ...accounts[index],
+    pinned: pinned === true,
+  };
+  writeAccounts(accounts);
+  return pinned ? `Pinned account '${name}'` : `Unpinned account '${name}'`;
+}
+
+function opSetExcludedFromRecommendation(name, excluded) {
+  const accounts = readAccounts();
+  const index = accounts.findIndex((entry) => entry.name === name);
+  if (index < 0) {
+    die(`unknown account: ${name}`);
+  }
+
+  accounts[index] = {
+    ...accounts[index],
+    excludedFromRecommendation: excluded === true,
+  };
+  writeAccounts(accounts);
+  return excluded
+    ? `Excluded account '${name}' from recommendation`
+    : `Included account '${name}' in recommendation`;
+}
+
+function formatRepairSummary(repair) {
+  if (!repair || (!repair.changed && !repair.activeChanged)) {
+    return "";
+  }
+
+  const parts = [];
+  if (repair.removed && repair.removed.length > 0) {
+    const names = repair.removed.map((entry) => entry.name).join(", ");
+    parts.push(`Auto-removed missing account${repair.removed.length === 1 ? "" : "s"}: ${names}`);
+  }
+  if (repair.activeChanged) {
+    if (repair.activeName) {
+      parts.push(`Active account is now '${repair.activeName}'`);
+    } else {
+      parts.push("No active account remains");
+    }
+  }
+
+  return parts.join(". ");
+}
+
+function pruneLiveRateLimitCache(accountPath) {
+  const resolvedPath = path.resolve(accountPath);
+  for (const key of LIVE_RATE_LIMIT_CACHE.keys()) {
+    if (key.startsWith(`${resolvedPath}::`)) {
+      LIVE_RATE_LIMIT_CACHE.delete(key);
+    }
+  }
+}
+
+function getLiveRateLimitCacheKey(accountPath) {
+  const stat = fs.statSync(accountPath);
+  return `${path.resolve(accountPath)}::${stat.mtimeMs}::${stat.size}`;
+}
+
+function withTimeout(promise, timeoutMs, label) {
+  let timeoutId = null;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
   });
 }
 
-function displayAccountList(p) {
-  const active = getActive();
-  const accounts = readAccounts();
-  if (accounts.length === 0) {
-    p.log.warn("No accounts configured.");
+function colorize(text, style, output = process.stdout) {
+  const code = ANSI[style];
+  if (!code || !output || !output.isTTY) {
+    return text;
+  }
+  return `${code}${text}${ANSI_RESET}`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function parsePathEntries(pathValue) {
+  return String(pathValue || "")
+    .split(path.delimiter)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function parseWindowsExtensions(pathext) {
+  const defaults = [".cmd", ".exe", ".bat"];
+  const extensions = String(pathext || "")
+    .split(";")
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
+  return Array.from(new Set([...defaults, ...extensions]));
+}
+
+function getWindowsCommandCandidates(command, env = process.env) {
+  const trimmed = String(command || "").trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  const ext = path.extname(trimmed).toLowerCase();
+  if (ext) {
+    return [trimmed];
+  }
+
+  const extensions = parseWindowsExtensions(env.PATHEXT);
+  return Array.from(new Set([...extensions.map((suffix) => `${trimmed}${suffix}`), trimmed]));
+}
+
+function resolveWindowsCommand(command, env = process.env, fileExists = isRegularFile) {
+  const trimmed = String(command || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  const hasPathReference = trimmed.includes("\\") || trimmed.includes("/") || path.isAbsolute(trimmed);
+  const candidates = getWindowsCommandCandidates(trimmed, env);
+  if (hasPathReference) {
+    for (const candidate of candidates) {
+      if (fileExists(candidate)) {
+        return candidate;
+      }
+    }
+    return trimmed;
+  }
+
+  for (const entry of parsePathEntries(env.PATH)) {
+    for (const candidate of candidates) {
+      const fullPath = path.join(entry, candidate);
+      if (fileExists(fullPath)) {
+        return fullPath;
+      }
+    }
+  }
+
+  return trimmed;
+}
+
+function resolveCodexBinary(options = {}) {
+  const env = options.env || process.env;
+  const platform = options.platform || process.platform;
+  const fileExists = typeof options.fileExists === "function" ? options.fileExists : isRegularFile;
+  const command = typeof options.command === "string" ? options.command : CODEX_BIN;
+  const useCache =
+    options.command === undefined &&
+    options.env === undefined &&
+    options.platform === undefined &&
+    options.fileExists === undefined;
+
+  if (useCache && RESOLVED_CODEX_BINARY) {
+    return RESOLVED_CODEX_BINARY;
+  }
+
+  const resolved = platform === "win32"
+    ? resolveWindowsCommand(command, env, fileExists)
+    : String(command || "").trim();
+
+  if (useCache) {
+    RESOLVED_CODEX_BINARY = resolved;
+  }
+  return resolved;
+}
+
+function requiresWindowsCmdWrapper(command, platform = process.platform) {
+  return platform === "win32" && /\.(cmd|bat)$/i.test(command);
+}
+
+function resolveNpmShimScript(command, fileExists = isRegularFile) {
+  const commandPath = String(command || "").trim();
+  if (!commandPath || !/\.(cmd|ps1)$/i.test(commandPath)) {
+    return "";
+  }
+
+  const scriptPath = path.join(path.dirname(commandPath), "node_modules", "@openai", "codex", "bin", "codex.js");
+  return fileExists(scriptPath) ? scriptPath : "";
+}
+
+function quoteWindowsCommandArgument(value) {
+  const stringValue = String(value);
+  if (!stringValue) {
+    return "\"\"";
+  }
+  if (!/[\s"]/u.test(stringValue)) {
+    return stringValue;
+  }
+  return `"${stringValue.replace(/"/g, "\"\"")}"`;
+}
+
+function getCodexLaunchSpec(baseArgs, options = {}) {
+  const env = options.env || process.env;
+  const platform = options.platform || process.platform;
+  const fileExists = typeof options.fileExists === "function" ? options.fileExists : isRegularFile;
+  const command = resolveCodexBinary(options);
+  const args = [...CODEX_BIN_ARGS, ...baseArgs];
+  const npmShimScript = platform === "win32" ? resolveNpmShimScript(command, fileExists) : "";
+
+  if (npmShimScript) {
+    return {
+      command: process.execPath,
+      args: [npmShimScript, ...args],
+    };
+  }
+
+  if (requiresWindowsCmdWrapper(command, platform)) {
+    const comspec = env.comspec || env.ComSpec || "cmd.exe";
+    const commandLine = [command, ...args].map(quoteWindowsCommandArgument).join(" ");
+    return {
+      command: comspec,
+      args: ["/d", "/s", "/c", commandLine],
+    };
+  }
+
+  return { command, args };
+}
+
+function getCodexAppServerArgs() {
+  return [...CODEX_BIN_ARGS, "app-server", "--listen", "stdio://"];
+}
+
+function createAppServerRequest(method, id, params) {
+  const message = { method, id };
+  if (params !== undefined) {
+    message.params = params;
+  }
+  return message;
+}
+
+function createAppServerNotification(method, params) {
+  const message = { method };
+  if (params !== undefined) {
+    message.params = params;
+  }
+  return message;
+}
+
+function createTemporaryCodexHome(sourceAuthPath) {
+  fs.mkdirSync(LIVE_RATE_LIMIT_TEMP_ROOT, { recursive: true });
+  const tempHome = fs.mkdtempSync(path.join(LIVE_RATE_LIMIT_TEMP_ROOT, LIVE_RATE_LIMIT_TEMP_PREFIX));
+  fs.copyFileSync(sourceAuthPath, path.join(tempHome, "auth.json"));
+  return tempHome;
+}
+
+function isRetryableWindowsCleanupError(error) {
+  return !!(error && typeof error.code === "string" && /^(EPERM|EBUSY|ENOTEMPTY)$/i.test(error.code));
+}
+
+async function cleanupTemporaryCodexHome(tempHome) {
+  const tempRoot = path.resolve(LIVE_RATE_LIMIT_TEMP_ROOT);
+  if (!tempHome || !(tempHome === tempRoot || tempHome.startsWith(`${tempRoot}${path.sep}`))) {
     return;
   }
 
-  const lines = accounts.map((account, index) => {
-    const marker = account.name === active ? "*" : " ";
-    return `${String(index + 1).padStart(2, " ")} ${marker} ${accountDisplayName(account)}  ${account.path}`;
+  const attempts = [0, 75, 200];
+  for (let index = 0; index < attempts.length; index += 1) {
+    try {
+      fs.rmSync(tempHome, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      if (!isRetryableWindowsCleanupError(err) || index === attempts.length - 1) {
+        return;
+      }
+      await sleep(attempts[index + 1]);
+    }
+  }
+}
+
+async function queryCodexAppServer(tempHome) {
+  const launchSpec = getCodexLaunchSpec(getCodexAppServerArgs());
+  let child;
+  try {
+    child = spawn(launchSpec.command, launchSpec.args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        CODEX_HOME: tempHome,
+      },
+    });
+  } catch (err) {
+    const error = err instanceof Error ? err : new Error(String(err));
+    error.appServerErrorCode = "spawn_failed";
+    error.partial = {};
+    throw error;
+  }
+
+  let stderr = "";
+  let stdoutBuffer = "";
+  let closed = false;
+  let exited = false;
+  let nextId = 1;
+  const pending = new Map();
+  const exitPromise = new Promise((resolve) => {
+    child.once("exit", () => {
+      exited = true;
+      resolve();
+    });
   });
-  p.note(lines.join("\n"), "Configured Accounts");
+
+  function rejectPending(error) {
+    for (const entry of pending.values()) {
+      entry.reject(error);
+    }
+    pending.clear();
+  }
+
+  function finalize(error) {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    rejectPending(error);
+  }
+
+  function send(message) {
+    if (!child.stdin.writable) {
+      throw new Error("codex app-server stdin is not writable");
+    }
+    child.stdin.write(`${JSON.stringify(message)}\n`);
+  }
+
+  function request(method, params) {
+    const id = nextId++;
+    return new Promise((resolve, reject) => {
+      pending.set(String(id), { resolve, reject });
+      try {
+        send(createAppServerRequest(method, id, params));
+      } catch (err) {
+        pending.delete(String(id));
+        reject(err);
+      }
+    });
+  }
+
+  function handleMessage(line) {
+    if (!line.trim()) {
+      return;
+    }
+
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch (_) {
+      return;
+    }
+
+    if (message && Object.prototype.hasOwnProperty.call(message, "id")) {
+      const key = String(message.id);
+      const pendingRequest = pending.get(key);
+      if (!pendingRequest) {
+        return;
+      }
+      pending.delete(key);
+
+      if (message.error) {
+        pendingRequest.reject(new Error(message.error.message || `codex app-server request '${key}' failed`));
+        return;
+      }
+
+      pendingRequest.resolve(message.result);
+    }
+  }
+
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+
+  child.stdout.on("data", (chunk) => {
+    stdoutBuffer += chunk;
+    let newlineIndex = stdoutBuffer.indexOf("\n");
+    while (newlineIndex >= 0) {
+      const line = stdoutBuffer.slice(0, newlineIndex);
+      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+      handleMessage(line);
+      newlineIndex = stdoutBuffer.indexOf("\n");
+    }
+  });
+
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+    if (stderr.length > 4096) {
+      stderr = stderr.slice(-4096);
+    }
+  });
+
+  child.on("error", (err) => {
+    finalize(err);
+  });
+
+  child.on("exit", (code, signal) => {
+    const details = stderr.trim();
+    const suffix = details ? `: ${details}` : "";
+    const message = signal
+      ? `codex app-server exited with signal ${signal}${suffix}`
+      : `codex app-server exited with code ${code}${suffix}`;
+    finalize(new Error(message));
+  });
+
+  function wrapStageError(error, stage, partial) {
+    const wrapped = error instanceof Error ? error : new Error(String(error));
+    if (stage === "initialize_failed" && wrapped && typeof wrapped.code === "string" && /^(ENOENT|EACCES|EPERM)$/i.test(wrapped.code)) {
+      wrapped.appServerErrorCode = "spawn_failed";
+    } else {
+      wrapped.appServerErrorCode = /timed out after /i.test(wrapped.message)
+        ? "timeout"
+        : stage;
+    }
+    wrapped.partial = partial;
+    return wrapped;
+  }
+
+  try {
+    try {
+      await withTimeout(
+        request("initialize", {
+          clientInfo: {
+            name: "cdx",
+            title: "cdx",
+            version: "0.2.0",
+          },
+        }),
+        APP_SERVER_INITIALIZE_TIMEOUT_MS,
+        "codex app-server initialize",
+      );
+    } catch (err) {
+      throw wrapStageError(err, "initialize_failed", {});
+    }
+
+    send(createAppServerNotification("initialized"));
+
+    let account;
+    try {
+      account = await withTimeout(
+        request("account/read", { refreshToken: true }),
+        APP_SERVER_ACCOUNT_READ_TIMEOUT_MS,
+        "codex app-server account/read",
+      );
+    } catch (err) {
+      throw wrapStageError(err, "account_read_failed", { account: null, rateLimits: null });
+    }
+
+    let rateLimits;
+    try {
+      rateLimits = await withTimeout(
+        request("account/rateLimits/read"),
+        APP_SERVER_RATE_LIMITS_TIMEOUT_MS,
+        "codex app-server account/rateLimits/read",
+      );
+    } catch (err) {
+      throw wrapStageError(err, "rate_limits_failed", { account, rateLimits: null });
+    }
+
+    return { account, rateLimits };
+  } finally {
+    child.stdin.end();
+    if (!child.killed && !exited) {
+      child.kill();
+    }
+    await withTimeout(exitPromise, 2_500, "codex app-server shutdown").catch(() => {});
+  }
+}
+
+function getRateLimitWindowLabel(windowDurationMins, fallbackLabel) {
+  const duration = Number(windowDurationMins);
+  if (!Number.isFinite(duration) || duration <= 0) {
+    return fallbackLabel;
+  }
+  if (duration === 7 * 24 * 60) {
+    return "weekly";
+  }
+  if (duration % (24 * 60) === 0 && duration >= 24 * 60) {
+    return `${duration / (24 * 60)}d`;
+  }
+  if (duration % 60 === 0) {
+    return `${duration / 60}h`;
+  }
+  return fallbackLabel;
+}
+
+function formatResetAt(seconds, now = new Date()) {
+  const numeric = Number(seconds);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return "";
+  }
+
+  const resetAt = new Date(numeric * 1000);
+  if (Number.isNaN(resetAt.getTime())) {
+    return "";
+  }
+
+  const pad = (value) => String(value).padStart(2, "0");
+  const time = `${pad(resetAt.getHours())}:${pad(resetAt.getMinutes())}`;
+  const isSameDay =
+    resetAt.getFullYear() === now.getFullYear() &&
+    resetAt.getMonth() === now.getMonth() &&
+    resetAt.getDate() === now.getDate();
+
+  if (isSameDay) {
+    return time;
+  }
+
+  const date = `${resetAt.getFullYear()}-${pad(resetAt.getMonth() + 1)}-${pad(resetAt.getDate())}`;
+  return `${date} ${time}`;
+}
+
+function createRateLimitWindowSummary(window, fallbackLabel, now = new Date()) {
+  if (!window || typeof window !== "object") {
+    return null;
+  }
+
+  const usedPercent = Number(window.usedPercent);
+  if (!Number.isFinite(usedPercent)) {
+    return null;
+  }
+
+  const resetAtSeconds = Number(window.resetsAt);
+
+  return {
+    label: getRateLimitWindowLabel(window.windowDurationMins, fallbackLabel),
+    remainingPercent: Math.max(0, Math.min(100, Math.round(100 - usedPercent))),
+    resetAt: formatResetAt(resetAtSeconds, now),
+    resetAtSeconds: Number.isFinite(resetAtSeconds) && resetAtSeconds > 0 ? resetAtSeconds : 0,
+  };
+}
+
+function formatCreditAmount(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "";
+  }
+  const rounded = Math.round(numeric * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : String(rounded);
+}
+
+function createCreditsSummary(credits) {
+  if (!credits || typeof credits !== "object") {
+    return null;
+  }
+
+  const hasCredits = credits.hasCredits === true || credits.has_credits === true;
+  const unlimited = credits.unlimited === true;
+  if (!hasCredits && !unlimited) {
+    return null;
+  }
+
+  const rawBalance = credits.balance;
+  const numericBalance = typeof rawBalance === "number"
+    ? rawBalance
+    : Number.parseFloat(String(rawBalance || "").trim());
+  const displayBalance = Number.isFinite(numericBalance)
+    ? formatCreditAmount(numericBalance)
+    : typeof rawBalance === "string" && rawBalance.trim()
+      ? rawBalance.trim()
+      : unlimited
+        ? "unlimited"
+        : "";
+
+  if (!displayBalance && !unlimited) {
+    return null;
+  }
+
+  return {
+    hasCredits,
+    unlimited,
+    balance: displayBalance,
+    numericBalance: Number.isFinite(numericBalance) ? numericBalance : null,
+  };
+}
+
+function createUnavailableRateLimitStatus(metadata = {}, errorCode = "unavailable") {
+  return {
+    available: false,
+    email: metadata.email || "",
+    planType: metadata.planType || "",
+    primary: null,
+    secondary: null,
+    credits: null,
+    errorCode,
+  };
+}
+
+function extractLiveAccount(accountResponse) {
+  return accountResponse && accountResponse.account && typeof accountResponse.account === "object"
+    ? accountResponse.account
+    : null;
+}
+
+function extractRateLimitSnapshot(rateLimitResponse) {
+  return rateLimitResponse && rateLimitResponse.rateLimits && typeof rateLimitResponse.rateLimits === "object"
+    ? rateLimitResponse.rateLimits
+    : null;
+}
+
+function getLiveRateLimitMetadata(metadata, liveAccount, snapshot) {
+  return {
+    email: liveAccount && typeof liveAccount.email === "string" ? liveAccount.email : metadata.email,
+    planType:
+      (liveAccount && typeof liveAccount.planType === "string" && normalizePlanType(liveAccount.planType)) ||
+      (snapshot && typeof snapshot.planType === "string" && normalizePlanType(snapshot.planType)) ||
+      metadata.planType,
+  };
+}
+
+async function fetchLiveRateLimitStatus(accountPath) {
+  const metadata = getAccountMetadata(accountPath);
+  if (!isRegularFile(accountPath)) {
+    return createUnavailableRateLimitStatus(metadata, "missing_auth");
+  }
+
+  const tempHome = createTemporaryCodexHome(accountPath);
+  try {
+    const query = APP_SERVER_QUERY || queryCodexAppServer;
+    const { account, rateLimits } = await query(tempHome);
+    const liveAccount = extractLiveAccount(account);
+    const snapshot = extractRateLimitSnapshot(rateLimits);
+    const liveMetadata = getLiveRateLimitMetadata(metadata, liveAccount, snapshot);
+    if (!snapshot) {
+      return createUnavailableRateLimitStatus(liveMetadata, "missing_rate_limits");
+    }
+
+    const now = new Date();
+    return {
+      available: true,
+      email: liveMetadata.email,
+      planType: liveMetadata.planType,
+      primary: createRateLimitWindowSummary(snapshot.primary, "5h", now),
+      secondary: createRateLimitWindowSummary(snapshot.secondary, "weekly", now),
+      credits: createCreditsSummary(snapshot.credits),
+      errorCode: "",
+    };
+  } catch (err) {
+    const partial = err && err.partial && typeof err.partial === "object" ? err.partial : {};
+    const liveAccount = extractLiveAccount(partial.account);
+    const snapshot = extractRateLimitSnapshot(partial.rateLimits);
+    const liveMetadata = getLiveRateLimitMetadata(metadata, liveAccount, snapshot);
+    return createUnavailableRateLimitStatus(liveMetadata, err && err.appServerErrorCode ? err.appServerErrorCode : "query_failed");
+  } finally {
+    await cleanupTemporaryCodexHome(tempHome);
+  }
+}
+
+async function getLiveRateLimitStatus(accountPath, options = {}) {
+  if (!isRegularFile(accountPath)) {
+    return createUnavailableRateLimitStatus(getAccountMetadata(accountPath), "missing_auth");
+  }
+
+  const cacheKey = getLiveRateLimitCacheKey(accountPath);
+  const forceRefresh = !!(options && options.forceRefresh);
+  const cached = forceRefresh ? null : LIVE_RATE_LIMIT_CACHE.get(cacheKey);
+  const now = Date.now();
+  if (cached && now - cached.fetchedAt < LIVE_RATE_LIMIT_TTL_MS) {
+    return cached.status;
+  }
+
+  const fetcher = LIVE_RATE_LIMIT_FETCHER || fetchLiveRateLimitStatus;
+  const status = await fetcher(accountPath);
+  pruneLiveRateLimitCache(accountPath);
+  LIVE_RATE_LIMIT_CACHE.set(cacheKey, { fetchedAt: now, status });
+  return status;
+}
+
+function hasFreshLiveRateLimitCache(accountPath, now = Date.now()) {
+  if (!isRegularFile(accountPath)) {
+    return false;
+  }
+
+  try {
+    const cacheKey = getLiveRateLimitCacheKey(accountPath);
+    const cached = LIVE_RATE_LIMIT_CACHE.get(cacheKey);
+    return !!(cached && now - cached.fetchedAt < LIVE_RATE_LIMIT_TTL_MS);
+  } catch (_) {
+    return false;
+  }
+}
+
+function getStatusWindows(status) {
+  return [status && status.primary ? status.primary : null, status && status.secondary ? status.secondary : null]
+    .filter(Boolean);
+}
+
+function getRemainingPercent(summary) {
+  const value = summary && Number(summary.remainingPercent);
+  return Number.isFinite(value) ? value : -1;
+}
+
+function isWindowDepleted(summary) {
+  return getRemainingPercent(summary) <= 0;
+}
+
+function getStatusCredits(status) {
+  return status && status.credits && typeof status.credits === "object" ? status.credits : null;
+}
+
+function getCreditBalanceValue(status) {
+  const credits = getStatusCredits(status);
+  if (!credits) {
+    return -1;
+  }
+  if (credits.unlimited === true) {
+    return Number.POSITIVE_INFINITY;
+  }
+  const numericBalance = Number(credits.numericBalance);
+  return Number.isFinite(numericBalance) ? numericBalance : -1;
+}
+
+function getCreditBalanceLabel(status) {
+  const credits = getStatusCredits(status);
+  if (!credits) {
+    return "";
+  }
+  if (credits.unlimited === true) {
+    return "unlimited";
+  }
+  return credits.balance || formatCreditAmount(credits.numericBalance);
+}
+
+function statusHasZeroCredits(status) {
+  const balance = getCreditBalanceValue(status);
+  return Number.isFinite(balance) && balance === 0;
+}
+
+function statusHasLowCredits(status) {
+  const balance = getCreditBalanceValue(status);
+  return Number.isFinite(balance) && balance > 0 && balance <= LOW_CREDITS_THRESHOLD;
+}
+
+function statusNeedsHardWarning(status) {
+  return statusHasDepletedLimit(status) || statusHasZeroCredits(status);
+}
+
+function isStatusUsableNow(status) {
+  return !!(status && status.available) && !statusHasDepletedLimit(status) && !statusHasZeroCredits(status);
+}
+
+function areAllEligibleAccountsExhausted(entries, disabledName = "") {
+  const eligible = entries.filter(
+    (entry) => entry.account.name !== disabledName && entry.account.excludedFromRecommendation !== true,
+  );
+  const available = eligible.filter((entry) => entry.status && entry.status.available);
+  return available.length > 0 && available.every((entry) => statusNeedsHardWarning(entry.status));
+}
+
+function areAllEligibleAccountsUnavailableOrExhausted(entries, disabledName = "") {
+  const eligible = entries.filter(
+    (entry) => entry.account.name !== disabledName && entry.account.excludedFromRecommendation !== true,
+  );
+  return eligible.length > 0 &&
+    eligible.some((entry) => !(entry.status && entry.status.available)) &&
+    eligible.every((entry) => !(entry.status && entry.status.available) || statusNeedsHardWarning(entry.status));
+}
+
+function getResetSortValue(summary) {
+  const raw = summary && Number(summary.resetAtSeconds);
+  return Number.isFinite(raw) && raw > 0 ? raw : Number.POSITIVE_INFINITY;
+}
+
+function getStatusRecommendation(status) {
+  if (!status || !status.available) {
+    return null;
+  }
+
+  const windows = getStatusWindows(status);
+  if (windows.length === 0) {
+    return null;
+  }
+
+  const primaryRemaining = getRemainingPercent(status.primary);
+  const secondaryRemaining = status.secondary ? getRemainingPercent(status.secondary) : 101;
+  const creditBalance = getCreditBalanceValue(status);
+  const primaryReset = getResetSortValue(status.primary);
+  const usableNow = isStatusUsableNow(status);
+
+  return {
+    usableNow,
+    primaryRemaining,
+    secondaryRemaining,
+    creditBalance,
+    primaryReset,
+  };
+}
+
+function compareRecommendationMetrics(left, right) {
+  if (!left && !right) {
+    return 0;
+  }
+  if (left && !right) {
+    return -1;
+  }
+  if (!left && right) {
+    return 1;
+  }
+
+  const comparators = [
+    [left.usableNow ? 0 : 1, right.usableNow ? 0 : 1, true],
+    [left.pinned ? 0 : 1, right.pinned ? 0 : 1, true],
+    [left.primaryRemaining, right.primaryRemaining, false],
+    [left.secondaryRemaining, right.secondaryRemaining, false],
+    [left.creditBalance, right.creditBalance, false],
+    [left.primaryReset, right.primaryReset, true],
+  ];
+
+  for (const [a, b, ascending] of comparators) {
+    if (a === b) {
+      continue;
+    }
+    return ascending ? a - b : b - a;
+  }
+
+  return 0;
+}
+
+function getRecommendedSwitchAccount(entries, activeName = "", disabledName = "") {
+  const candidates = entries.filter(
+    (entry) => entry.account.name !== disabledName && entry.account.excludedFromRecommendation !== true,
+  );
+  if (candidates.length === 0) {
+    return "";
+  }
+
+  const decorated = candidates.map((entry, index) => ({
+    ...entry,
+    index,
+    recommendation: (() => {
+      const metrics = getStatusRecommendation(entry.status);
+      return metrics ? { ...metrics, pinned: entry.account.pinned === true } : null;
+    })(),
+  }));
+
+  decorated.sort((left, right) => {
+    const comparison = compareRecommendationMetrics(left.recommendation, right.recommendation);
+    if (comparison !== 0) {
+      return comparison;
+    }
+    return left.index - right.index;
+  });
+
+  const top = decorated[0];
+  return top && top.recommendation && top.recommendation.usableNow
+    ? top.account.name
+    : "";
+}
+
+function setLiveRateLimitFetcherForTests(fetcher) {
+  LIVE_RATE_LIMIT_FETCHER = typeof fetcher === "function" ? fetcher : null;
+}
+
+function setCodexAppServerQueryForTests(query) {
+  APP_SERVER_QUERY = typeof query === "function" ? query : null;
+}
+
+function formatPlanBadge(planType) {
+  const normalized = normalizePlanType(planType);
+  return normalized ? `[${normalized.toUpperCase()}]` : "";
+}
+
+function formatPinnedBadge(isPinned) {
+  return isPinned ? colorize("[PINNED]", "boldYellow") : "";
+}
+
+function formatExcludedBadge(isExcluded) {
+  return isExcluded ? colorize("[EXCLUDED]", "dim") : "";
+}
+
+function formatRecommendedBadge(isRecommended) {
+  return isRecommended ? colorize("[RECOMMENDED]", "boldCyan") : "";
+}
+
+function formatActiveBadge(isActive) {
+  return isActive ? colorize("[ACTIVE]", "boldGreen") : "";
+}
+
+function formatDepletedBadge(summary) {
+  if (!summary || !isWindowDepleted(summary)) {
+    return "";
+  }
+  return colorize(`[${summary.label.toUpperCase()} 0%]`, "boldRed");
+}
+
+function formatFiveHourInline(status) {
+  if (!status || !status.available || !status.primary) {
+    return colorize("5h   — (reset —)", "dim");
+  }
+  const remainingRaw = Number(status.primary.remainingPercent);
+  if (!Number.isFinite(remainingRaw)) {
+    return colorize("5h   — (reset —)", "dim");
+  }
+  const clamped = Math.max(0, Math.min(100, remainingRaw));
+  const percentText = String(clamped).padStart(3);
+  const resetAt = status.primary && status.primary.resetAt ? String(status.primary.resetAt) : "—";
+  const text = `5h ${percentText}% (reset ${resetAt})`;
+  let style = "boldGreen";
+  if (clamped < 34) {
+    style = "boldRed";
+  } else if (clamped < 67) {
+    style = "boldYellow";
+  }
+  return colorize(text, style);
+}
+
+function formatCreditsBadge(status) {
+  const balanceLabel = getCreditBalanceLabel(status);
+  if (!balanceLabel) {
+    return "";
+  }
+  if (statusHasZeroCredits(status)) {
+    return colorize("[0 CR]", "boldRed");
+  }
+  if (statusHasLowCredits(status)) {
+    return colorize(`[LOW ${balanceLabel} CR]`, "boldYellow");
+  }
+  return "";
+}
+
+const SWITCH_LABEL_COLUMN_GAP = "   ";
+const SWITCH_LABEL_BADGE_GAP = "  ";
+const MAX_EMAIL_COLUMN_WIDTH = 32;
+
+function padColumn(value, width, align = "left") {
+  const text = String(value == null ? "" : value);
+  if (!Number.isInteger(width) || width <= 0 || text.length >= width) {
+    return text;
+  }
+  return align === "right" ? text.padStart(width) : text.padEnd(width);
+}
+
+function truncateToWidth(value, maxWidth) {
+  const text = String(value == null ? "" : value);
+  if (!Number.isInteger(maxWidth) || maxWidth <= 0 || text.length <= maxWidth) {
+    return text;
+  }
+  if (maxWidth === 1) {
+    return "…";
+  }
+  return `${text.slice(0, maxWidth - 1)}…`;
+}
+
+function buildSwitchAccountLabel(account, status, activeName = "", recommendedName = "", layout = {}) {
+  const metadata = getAccountMetadata(account.path);
+  const email = status && status.email ? status.email : metadata.email;
+
+  const nameWidth = Number.isInteger(layout.nameWidth) && layout.nameWidth > 0
+    ? layout.nameWidth
+    : (account.name ? account.name.length : 0);
+  const emailWidth = Number.isInteger(layout.emailWidth) && layout.emailWidth > 0
+    ? layout.emailWidth
+    : (email ? Math.min(email.length, MAX_EMAIL_COLUMN_WIDTH) : 0);
+
+  const nameColumn = padColumn(account.name || "", nameWidth, "right");
+  const emailText = email ? truncateToWidth(email, emailWidth) : "";
+  const emailColumn = email ? padColumn(emailText, emailWidth, "left") : "";
+  const fiveHour = formatFiveHourInline(status);
+
+  const badges = [
+    formatPinnedBadge(account.pinned === true),
+    formatExcludedBadge(account.excludedFromRecommendation === true),
+    formatDepletedBadge(status && status.secondary),
+    formatCreditsBadge(status),
+    formatRecommendedBadge(account.name === recommendedName),
+    formatActiveBadge(account.name === activeName),
+  ].filter(Boolean).join(SWITCH_LABEL_BADGE_GAP);
+
+  const parts = [nameColumn];
+  if (emailColumn) {
+    parts.push(emailColumn);
+  }
+  parts.push(fiveHour);
+  if (badges) {
+    parts.push(badges);
+  }
+  return parts.join(SWITCH_LABEL_COLUMN_GAP);
+}
+
+function formatRateLimitHint(summary) {
+  if (!summary) {
+    return "";
+  }
+
+  const base = `${summary.label} ${summary.remainingPercent}%`;
+  return summary.resetAt ? `${base} (reset ${summary.resetAt})` : base;
+}
+
+function getDepletedLimitLabels(status) {
+  return getStatusWindows(status)
+    .filter(isWindowDepleted)
+    .map((summary) => summary.label);
+}
+
+function statusHasDepletedLimit(status) {
+  return getDepletedLimitLabels(status).length > 0;
+}
+
+const SWITCH_HINT_SEPARATOR = "  ·  ";
+
+function buildSwitchAccountHint(account, activeName, status) {
+  if (!status || !status.available) {
+    return "limits unavailable";
+  }
+
+  const hints = [];
+  if (status.primary) {
+    hints.push(formatRateLimitHint(status.primary));
+  }
+  if (status.secondary) {
+    hints.push(formatRateLimitHint(status.secondary));
+  }
+  if (statusHasZeroCredits(status)) {
+    hints.push("credits 0");
+  } else if (statusHasLowCredits(status)) {
+    hints.push(`low credits ${getCreditBalanceLabel(status)}`);
+  }
+
+  if (hints.length === 0) {
+    return "limits unavailable";
+  }
+
+  return hints.join(SWITCH_HINT_SEPARATOR);
+}
+
+async function mapWithConcurrency(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let index = 0;
+  const workers = Array.from({ length: Math.min(Math.max(concurrency, 1), items.length) }, async () => {
+    while (true) {
+      const currentIndex = index++;
+      if (currentIndex >= items.length) {
+        return;
+      }
+      results[currentIndex] = await worker(items[currentIndex], currentIndex);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function loadSwitchAccountEntries(accounts, options = {}) {
+  return mapWithConcurrency(accounts, LIVE_RATE_LIMIT_CONCURRENCY, async (account) => {
+    const status = await getLiveRateLimitStatus(account.path, options);
+    return { account, status };
+  });
+}
+
+function buildSwitchAccountSelection(entries, activeName, disabledName) {
+  const recommendedValue = getRecommendedSwitchAccount(entries, activeName, disabledName);
+
+  const resolvedEmails = entries.map(({ account, status }) => {
+    const md = getAccountMetadata(account.path);
+    const email = status && status.email ? status.email : md.email;
+    return typeof email === "string" ? email : "";
+  });
+  const nameWidth = entries.reduce(
+    (max, { account }) => Math.max(max, account.name ? account.name.length : 0),
+    0,
+  );
+  const emailWidth = Math.min(
+    MAX_EMAIL_COLUMN_WIDTH,
+    resolvedEmails.reduce((max, email) => Math.max(max, email.length), 0),
+  );
+  const layout = { nameWidth, emailWidth };
+
+  const options = entries.map(({ account, status }) => ({
+    value: account.name,
+    label: buildSwitchAccountLabel(account, status, activeName, recommendedValue, layout),
+    hint: buildSwitchAccountHint(account, activeName, status),
+    disabled: account.name === disabledName,
+  }));
+
+  return {
+    options,
+    recommendedValue,
+    entriesByName: new Map(entries.map((entry) => [entry.account.name, entry])),
+  };
+}
+
+function createRateLimitWindowSnapshot(summary) {
+  if (!summary) {
+    return null;
+  }
+
+  return {
+    label: summary.label,
+    remainingPercent: summary.remainingPercent,
+    resetAt: summary.resetAt,
+    resetAtSeconds: summary.resetAtSeconds,
+  };
+}
+
+function createStatusSnapshot(status) {
+  if (!status) {
+    return null;
+  }
+
+  return {
+    available: status.available === true,
+    email: status.email || "",
+    planType: status.planType || "",
+    primary: createRateLimitWindowSnapshot(status.primary),
+    secondary: createRateLimitWindowSnapshot(status.secondary),
+    lowCredits: statusHasLowCredits(status),
+    zeroCredits: statusHasZeroCredits(status),
+    credits: (() => {
+      const credits = getStatusCredits(status);
+      if (!credits) {
+        return null;
+      }
+      return {
+        hasCredits: credits.hasCredits === true,
+        unlimited: credits.unlimited === true,
+        balance: credits.balance || "",
+      };
+    })(),
+    errorCode: status.errorCode || "",
+  };
+}
+
+function getSmartSwitchFailureMessage(result) {
+  if (result && result.reason === "all_unavailable_or_exhausted") {
+    return "All eligible accounts are exhausted or their limits are unavailable right now.";
+  }
+  if (result && result.reason === "all_exhausted") {
+    return "All eligible accounts are exhausted right now.";
+  }
+  if (result && result.reason === "no_accounts") {
+    return "No accounts configured.";
+  }
+  return "No smart-switch account is available.";
+}
+
+function getSmartSwitchDecisionFromSelection(selection, activeName) {
+  const entries = selection && selection.entriesByName
+    ? Array.from(selection.entriesByName.values())
+    : [];
+  const recommendedValue = selection && typeof selection.recommendedValue === "string"
+    ? selection.recommendedValue
+    : "";
+  const activeEntry = entries.find((entry) => entry.account.name === activeName) || null;
+  const recommendedEntry = recommendedValue
+    ? (selection.entriesByName.get(recommendedValue) || null)
+    : null;
+
+  if (!recommendedEntry) {
+    const allExhausted = areAllEligibleAccountsExhausted(entries);
+    const allUnavailableOrExhausted = areAllEligibleAccountsUnavailableOrExhausted(entries);
+    return {
+      ok: false,
+      switched: false,
+      alreadyOptimal: false,
+      allExhausted: allExhausted && !allUnavailableOrExhausted,
+      from: activeName || "",
+      to: "",
+      reason: entries.length === 0
+        ? "no_accounts"
+        : (allUnavailableOrExhausted ? "all_unavailable_or_exhausted" : (allExhausted ? "all_exhausted" : "no_recommendation")),
+      activeStatus: createStatusSnapshot(activeEntry ? activeEntry.status : null),
+      recommendedStatus: null,
+    };
+  }
+
+  const lowCredits = statusHasLowCredits(recommendedEntry.status);
+  if (recommendedValue === activeName) {
+    return {
+      ok: true,
+      switched: false,
+      alreadyOptimal: true,
+      allExhausted: false,
+      from: activeName || "",
+      to: recommendedValue,
+      reason: lowCredits ? "already_optimal_low_credits" : "already_optimal",
+      activeStatus: createStatusSnapshot(recommendedEntry.status),
+      recommendedStatus: createStatusSnapshot(recommendedEntry.status),
+    };
+  }
+
+  return {
+    ok: true,
+    switched: false,
+    alreadyOptimal: false,
+    allExhausted: false,
+    from: activeName || "",
+    to: recommendedValue,
+    reason: lowCredits ? "best_available_low_credits" : "best_available",
+    activeStatus: createStatusSnapshot(activeEntry ? activeEntry.status : null),
+    recommendedStatus: createStatusSnapshot(recommendedEntry.status),
+  };
+}
+
+async function buildSwitchAccountOptions(accounts, activeName, disabledName, options = {}) {
+  const entries = await loadSwitchAccountEntries(accounts, options);
+  return buildSwitchAccountSelection(entries, activeName, disabledName).options;
+}
+
+async function runSmartSwitchOperation(options = {}) {
+  const accounts = readAccounts();
+  const activeName = getActive();
+
+  if (accounts.length === 0) {
+    return {
+      ok: false,
+      switched: false,
+      alreadyOptimal: false,
+      allExhausted: false,
+      from: activeName || "",
+      to: "",
+      reason: "no_accounts",
+      activeStatus: null,
+      recommendedStatus: null,
+    };
+  }
+
+  const { entries: keptEntries } = await fetchEntriesWithCleanup(null, accounts, activeName, {
+    forceRefresh: !!(options && options.forceRefreshLiveLimits),
+  });
+  if (keptEntries.length === 0) {
+    return {
+      ok: false,
+      switched: false,
+      alreadyOptimal: false,
+      allExhausted: false,
+      from: activeName || "",
+      to: "",
+      reason: "no_accounts",
+      activeStatus: null,
+      recommendedStatus: null,
+    };
+  }
+  const selection = buildSwitchAccountSelection(keptEntries, activeName, "");
+  const decision = getSmartSwitchDecisionFromSelection(selection, activeName);
+  if (!decision.ok || decision.alreadyOptimal || !decision.to) {
+    return decision;
+  }
+
+  opUse(decision.to);
+  return {
+    ...decision,
+    switched: true,
+  };
+}
+
+
+async function loadSwitchAccountEntriesWithLoading(p, accounts, options = {}) {
+  const shouldShowLoading = accounts.some((account) => !hasFreshLiveRateLimitCache(account.path));
+  const loading = shouldShowLoading && p && typeof p.spinner === "function" ? p.spinner() : null;
+
+  if (loading) {
+    loading.start("Loading account info...");
+  }
+
+  try {
+    return await loadSwitchAccountEntries(accounts, options);
+  } finally {
+    if (loading) {
+      loading.clear();
+    }
+  }
+}
+
+async function fetchEntriesWithCleanup(p, accounts, activeName, options = {}) {
+  const cacheFreshness = new Map(
+    accounts.map((account) => [account.name, hasFreshLiveRateLimitCache(account.path)]),
+  );
+  const entries = await loadSwitchAccountEntriesWithLoading(p, accounts, options);
+  const cleanup = await performAccountCleanup(p, {
+    entries,
+    cacheFreshness,
+    activeName,
+  });
+  const keptEntries = cleanup.deletedNames.size > 0
+    ? entries.filter((entry) => !cleanup.deletedNames.has(entry.account.name))
+    : entries;
+  return { entries: keptEntries, cleanup };
+}
+
+async function loadSwitchAccountSelection(p, accounts, activeName, disabledName) {
+  const entries = await loadSwitchAccountEntriesWithLoading(p, accounts);
+  return buildSwitchAccountSelection(entries, activeName, disabledName);
+}
+
+function sortEntriesByFiveHour(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return [];
+  }
+  const decorated = entries.map((entry, index) => {
+    const status = entry && entry.status ? entry.status : null;
+    const primary = status && status.primary ? status.primary : null;
+    return {
+      entry,
+      index,
+      available: !!(status && status.available),
+      primaryRemaining: getRemainingPercent(primary),
+    };
+  });
+  decorated.sort((a, b) => {
+    if (a.available !== b.available) {
+      return a.available ? -1 : 1;
+    }
+    if (a.primaryRemaining !== b.primaryRemaining) {
+      return b.primaryRemaining - a.primaryRemaining;
+    }
+    return a.index - b.index;
+  });
+  return decorated.map((d) => d.entry);
+}
+
+function evaluateCurrentAuthRegistration() {
+  if (!isRegularFile(TARGET_AUTH)) {
+    return { needed: false, reason: "no_codex_auth" };
+  }
+  const currentMetadata = getAccountMetadata(TARGET_AUTH);
+  const hasIdentity = !!(
+    (currentMetadata && typeof currentMetadata.accountId === "string" && currentMetadata.accountId.trim()) ||
+    (currentMetadata && typeof currentMetadata.email === "string" && currentMetadata.email.trim())
+  );
+  if (!hasIdentity) {
+    return { needed: false, reason: "missing_identity" };
+  }
+  const accounts = readAccounts();
+  const matched = findMatchingSavedAccount(accounts, currentMetadata, getAccountMetadata);
+  if (matched) {
+    return { needed: false, reason: "already_saved", matchedName: matched.name };
+  }
+  return {
+    needed: true,
+    reason: "unsaved",
+    currentEmail: currentMetadata.email || "",
+    suggestedName: getFirstAvailableNumericAccountName(accounts),
+  };
+}
+
+async function promptCurrentAuthRegistrationIfNeeded(p) {
+  const decision = evaluateCurrentAuthRegistration();
+  if (!decision.needed) {
+    return decision;
+  }
+
+  const emailPart = decision.currentEmail ? ` <${decision.currentEmail}>` : "";
+  const raw = await p.text({
+    message: `Current Codex auth${emailPart} is not saved. Name it (empty = ${decision.suggestedName})`,
+    placeholder: decision.suggestedName,
+    validate: (value) => {
+      const next = String(value || "").trim();
+      if (!next) {
+        return undefined;
+      }
+      if (readAccounts().some((entry) => entry.name === next)) {
+        return "Account name already exists";
+      }
+      return undefined;
+    },
+  });
+  if (p.isCancel(raw)) {
+    p.log.info("Skipped saving current Codex auth.");
+    return { ...decision, skipped: true };
+  }
+  const name = String(raw || "").trim() || decision.suggestedName;
+  p.log.success(opSave(name));
+  return { ...decision, saved: true, name };
+}
+
+async function performAccountAddition(p) {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "cdx-add-account-"));
+  try {
+    const launchSpec = getCodexLaunchSpec(["-c", 'cli_auth_credentials_store="file"', "login"]);
+    if (!launchSpec.command) {
+      p.log.error("Codex binary not found. Set CDX_CODEX_BIN to the codex executable.");
+      return { added: false, reason: "no_binary" };
+    }
+
+    p.log.message("Opening Codex login in your browser...");
+    const exitCode = await new Promise((resolve) => {
+      const child = spawn(launchSpec.command, launchSpec.args, {
+        env: { ...process.env, CODEX_HOME: tempHome },
+        stdio: "inherit",
+      });
+      child.on("exit", (code) => resolve(typeof code === "number" ? code : 1));
+      child.on("error", () => resolve(-1));
+    });
+
+    try {
+      if (process.stdin && typeof process.stdin.setRawMode === "function" && process.stdin.isTTY) {
+        process.stdin.setRawMode(false);
+      }
+    } catch (_) {
+      // best-effort cleanup of any raw mode the child may have left behind
+    }
+
+    const newAuthPath = path.join(tempHome, "auth.json");
+    if (exitCode !== 0) {
+      if (exitCode === -1) {
+        p.log.error("Failed to launch codex for login.");
+        return { added: false, reason: "launch_error" };
+      }
+      p.log.warn(`Codex login exited with code ${exitCode}; no account saved.`);
+      return { added: false, reason: "login_failed" };
+    }
+    if (!isRegularFile(newAuthPath)) {
+      p.log.warn("Codex login finished but no auth file was produced; no account saved.");
+      return { added: false, reason: "no_auth_produced" };
+    }
+
+    const suggested = getFirstAvailableNumericAccountName(readAccounts());
+    const raw = await p.text({
+      message: `Name for the new account (empty = ${suggested})`,
+      placeholder: suggested,
+      validate: (value) => {
+        const next = String(value || "").trim();
+        if (!next) {
+          return undefined;
+        }
+        if (readAccounts().some((entry) => entry.name === next)) {
+          return "Account name already exists";
+        }
+        return undefined;
+      },
+    });
+    if (p.isCancel(raw)) {
+      p.log.info("Add cancelled.");
+      return { added: false, reason: "name_cancelled" };
+    }
+    const name = String(raw || "").trim() || suggested;
+
+    const snapshotDir = path.join(CDX_DIR, "auth");
+    const snapshotPath = path.join(snapshotDir, `${name}.auth.json`);
+    fs.mkdirSync(snapshotDir, { recursive: true });
+    fs.copyFileSync(newAuthPath, snapshotPath);
+    try {
+      fs.chmodSync(snapshotPath, 0o600);
+    } catch (_) {
+      // chmod unsupported on this platform
+    }
+
+    const accounts = readAccounts();
+    writeAccounts(upsertAccount(accounts, name, snapshotPath));
+    p.log.success(`Added account '${name}'.`);
+    return { added: true, name };
+  } finally {
+    try {
+      fs.rmSync(tempHome, { recursive: true, force: true });
+    } catch (_) {
+      // temp cleanup is best-effort
+    }
+  }
+}
+
+async function performAccountCleanup(p, { entries, cacheFreshness, activeName }) {
+  const online = await isOnline();
+  const health = readAccountHealth();
+  const decision = decideAccountCleanups({
+    entries,
+    cacheFreshness,
+    health,
+    activeName,
+    isOnline: online,
+    threshold: DEFAULT_CLEANUP_THRESHOLD,
+  });
+
+  if (decision.skipped) {
+    return { deletedNames: new Set(), skipped: true, reason: decision.reason };
+  }
+
+  const updatedHealth = { ...health };
+  for (const [name, update] of Object.entries(decision.healthUpdates)) {
+    updatedHealth[name] = { ...(updatedHealth[name] || {}), ...update };
+  }
+
+  const deletedNames = new Set();
+  for (const name of decision.toDelete) {
+    const stillPresent = findAccount(readAccounts(), name);
+    if (!stillPresent) {
+      delete updatedHealth[name];
+      continue;
+    }
+    try {
+      opRemove(name);
+      deletedNames.add(name);
+      delete updatedHealth[name];
+      if (p && p.log && typeof p.log.warn === "function") {
+        p.log.warn(
+          `Auto-removed stale account '${name}' after ${DEFAULT_CLEANUP_THRESHOLD} unresponsive checks (WiFi ok, other accounts responding).`,
+        );
+      }
+    } catch (_) {
+      // leave health entry intact so the next run can retry the removal
+    }
+  }
+
+  try {
+    writeAccountHealth(updatedHealth);
+  } catch (_) {
+    // persistence is best-effort; counters simply won't carry over
+  }
+
+  return { deletedNames, skipped: false, reason: "" };
+}
+
+function buildDepletedWarningMessage(name, status) {
+  const labels = getDepletedLimitLabels(status);
+  const hasZeroCredits = statusHasZeroCredits(status);
+  if (labels.length === 0 && !hasZeroCredits) {
+    return "";
+  }
+  if (labels.length === 0) {
+    return `Account '${name}' has 0 credits. Switch anyway?`;
+  }
+  if (!hasZeroCredits) {
+    return labels.length === 1
+      ? `Account '${name}' is exhausted for ${labels[0]}. Switch anyway?`
+      : `Account '${name}' is exhausted for ${labels.join(", ")}. Switch anyway?`;
+  }
+  return labels.length === 1
+    ? `Account '${name}' is exhausted for ${labels[0]} and has 0 credits. Switch anyway?`
+    : `Account '${name}' is exhausted for ${labels.join(", ")} and has 0 credits. Switch anyway?`;
+}
+
+async function confirmDepletedSelection(p, name, status) {
+  if (!statusNeedsHardWarning(status)) {
+    return true;
+  }
+
+  return promptValue(
+    p,
+    p.confirm({
+      message: buildDepletedWarningMessage(name, status),
+      active: "Switch anyway",
+      inactive: "Back",
+      initialValue: false,
+    }),
+  );
 }
 
 async function loadPrompts() {
@@ -505,6 +2274,31 @@ async function loadPrompts() {
       `failed to load @clack/prompts (${err.message}). Install dependencies and try again.`,
     );
   }
+}
+
+async function loadClackCore() {
+  try {
+    return await import("@clack/core");
+  } catch (err) {
+    die(
+      `failed to load @clack/core (${err.message}). Install dependencies and try again.`,
+    );
+  }
+}
+
+const CLACK_STYLE_MAP = {
+  cyan: "boldCyan",
+  gray: "dim",
+  dim: "dim",
+  strikethrough: "dim",
+};
+
+function clackStyle(kind, text) {
+  const mapped = CLACK_STYLE_MAP[kind] || null;
+  if (!mapped) {
+    return text;
+  }
+  return colorize(text, mapped);
 }
 
 function requireTTY() {
@@ -528,22 +2322,259 @@ async function promptValue(p, promise) {
   return value;
 }
 
-async function chooseAccount(p, message, opts = {}) {
-  const accounts = readAccounts();
-  if (accounts.length === 0) {
-    p.log.warn("No accounts configured.");
-    return "";
-  }
+const WIFI_STATUS_CACHE_TTL_MS = 10_000;
+let WIFI_STATUS_CACHE = { value: null, checkedAt: 0 };
 
-  const selection = await promptValue(
-    p,
-    p.select({
-      message,
-      options: toAccountOptions(accounts, getActive(), opts.disabledName),
-      initialValue: opts.initialValue,
-    }),
-  );
-  return selection;
+async function checkWifiStatus(now = Date.now) {
+  const currentTime = typeof now === "function" ? now() : now;
+  if (
+    WIFI_STATUS_CACHE.value !== null
+    && currentTime - WIFI_STATUS_CACHE.checkedAt < WIFI_STATUS_CACHE_TTL_MS
+  ) {
+    return WIFI_STATUS_CACHE.value;
+  }
+  const online = await isOnline({ timeoutMs: 1500 });
+  WIFI_STATUS_CACHE = { value: online, checkedAt: currentTime };
+  return online;
+}
+
+function resetWifiStatusCacheForTests() {
+  WIFI_STATUS_CACHE = { value: null, checkedAt: 0 };
+}
+
+function formatMainMenuMessage(activeName, online) {
+  const activePart = activeName ? `active: ${activeName}` : "no active account";
+  const wifiLabel = online
+    ? colorize("wifi ok", "boldGreen")
+    : colorize("wifi down", "boldRed");
+  return `Choose an action (${activePart} · ${wifiLabel})`;
+}
+
+function getManualActionOptions() {
+  return [
+    { value: "smart", label: "Smart switch", hint: "Use the healthiest account now" },
+    { value: "switch", label: "Account list", hint: "Enter activates, Space adds, Tab renames, Del removes" },
+    { value: "add", label: "Add account", hint: "Log in via browser to add a new account" },
+    { value: "settings", label: "CDX settings", hint: "Configure wrapper defaults" },
+    { value: "exit", label: "Exit" },
+  ];
+}
+
+const ACCESS_MODE_LABELS = {
+  "read-only": "Read Only",
+  "default": "Default",
+  "full-access": "Full Access",
+};
+
+const ACCESS_MODE_FLAGS = {
+  "read-only": ["--sandbox", "read-only", "--ask-for-approval", "never"],
+  "default": [],
+  "full-access": ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+};
+
+function getAccessModeLabel(accessMode) {
+  return ACCESS_MODE_LABELS[accessMode] || ACCESS_MODE_LABELS.default;
+}
+
+function getSettingsMenuOptions(settings = {}) {
+  const mode = settings && settings.accessMode ? settings.accessMode : "default";
+  return [
+    {
+      value: "access-mode",
+      label: "Access mode",
+      hint: getAccessModeLabel(mode),
+    },
+    { value: "back", label: "Back" },
+  ];
+}
+
+function getAccessModeOptions() {
+  return [
+    { value: "read-only", label: "Read Only" },
+    { value: "default", label: "Default" },
+    { value: "full-access", label: "Full Access" },
+  ];
+}
+
+function getAccessModeInitialValue(settings = {}) {
+  const mode = settings && typeof settings.accessMode === "string" ? settings.accessMode : "";
+  return ACCESS_MODE_LABELS[mode] ? mode : "default";
+}
+
+function hasExplicitAccessFlags(args = []) {
+  const values = Array.isArray(args) ? args : [];
+  for (let index = 0; index < values.length; index += 1) {
+    const current = values[index];
+    if (typeof current !== "string") {
+      continue;
+    }
+    if (
+      current === "-a" ||
+      current === "--ask-for-approval" ||
+      /^-a(?:=.+|.+)$/.test(current) ||
+      /^--ask-for-approval=.+$/.test(current) ||
+      current === "-s" ||
+      current === "--sandbox" ||
+      /^-s.+$/.test(current) ||
+      /^--sandbox=.+$/.test(current)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function applySavedAccessMode({ forwardedArgs, settings }) {
+  const args = Array.isArray(forwardedArgs) ? [...forwardedArgs] : [];
+  const mode = settings && typeof settings.accessMode === "string" ? settings.accessMode : "";
+  const injection = ACCESS_MODE_FLAGS[mode];
+  if (!injection || injection.length === 0) {
+    return args;
+  }
+  if (hasExplicitAccessFlags(args)) {
+    return args;
+  }
+  return [...injection, ...args];
+}
+
+const ADD_ACCOUNT_SENTINEL = "__cdx_add_account__";
+
+async function runAccountListPicker(p) {
+  const clackCore = await loadClackCore();
+
+  while (true) {
+    const accounts = readAccounts();
+    if (accounts.length === 0) {
+      p.log.warn("No accounts configured.");
+      return "continue";
+    }
+
+    const activeName = getActive();
+    const { entries: keptEntries } = await fetchEntriesWithCleanup(p, accounts, activeName);
+    if (keptEntries.length === 0) {
+      p.log.warn("No accounts configured.");
+      return "continue";
+    }
+    const sortedEntries = sortEntriesByFiveHour(keptEntries);
+    const selection = buildSwitchAccountSelection(sortedEntries, activeName, "");
+
+    const addOption = {
+      value: ADD_ACCOUNT_SENTINEL,
+      label: "+ Add account",
+      hint: "Log in via browser and save as a new profile",
+    };
+    const listOptions = [addOption, ...selection.options];
+    const initialValue = selection.options[0] ? selection.options[0].value : ADD_ACCOUNT_SENTINEL;
+
+    const result = await runAccountListPrompt({
+      clackCore,
+      addSentinel: ADD_ACCOUNT_SENTINEL,
+      message: activeName ? `Account list (active: ${activeName})` : "Account list",
+      hint: "↑↓ navigate   ·   Enter activate   ·   Space add   ·   Tab rename   ·   Del remove   ·   Esc back",
+      options: listOptions,
+      initialValue,
+      style: clackStyle,
+    });
+
+    if (result.action === "cancel") {
+      return "continue";
+    }
+
+    if (result.action === "add") {
+      await performAccountAddition(p);
+      continue;
+    }
+
+    if (result.action === "rename") {
+      if (!result.value || result.value === ADD_ACCOUNT_SENTINEL) {
+        continue;
+      }
+      const currentAccounts = readAccounts();
+      let raw;
+      try {
+        raw = await promptValue(
+          p,
+          p.text({
+            message: `Rename '${result.value}' to`,
+            placeholder: result.value,
+            validate: (value) => {
+              const next = String(value || "").trim();
+              if (!next) {
+                return undefined;
+              }
+              if (next !== result.value && currentAccounts.some((existing) => existing.name === next)) {
+                return "Account name already exists";
+              }
+              return undefined;
+            },
+          }),
+        );
+      } catch (err) {
+        if (err instanceof PromptCancelledError) {
+          continue;
+        }
+        throw err;
+      }
+      const newName = String(raw || "").trim();
+      if (!newName || newName === result.value) {
+        p.log.info("Rename cancelled.");
+        continue;
+      }
+      p.log.success(opRename(result.value, newName));
+      continue;
+    }
+
+    if (result.action === "delete") {
+      if (!result.value || result.value === ADD_ACCOUNT_SENTINEL) {
+        continue;
+      }
+      let ok;
+      try {
+        ok = await promptValue(
+          p,
+          p.confirm({
+            message: `Remove '${result.value}'?`,
+            initialValue: false,
+          }),
+        );
+      } catch (err) {
+        if (err instanceof PromptCancelledError) {
+          continue;
+        }
+        throw err;
+      }
+      if (!ok) {
+        p.log.info("Remove cancelled.");
+        continue;
+      }
+      p.log.success(opRemove(result.value));
+      continue;
+    }
+
+    if (result.action === "select") {
+      if (result.value === ADD_ACCOUNT_SENTINEL) {
+        await performAccountAddition(p);
+        continue;
+      }
+      const entry = selection.entriesByName.get(result.value);
+      if (entry && statusHasDepletedLimit(entry.status)) {
+        let confirmed;
+        try {
+          confirmed = await confirmDepletedSelection(p, result.value, entry.status);
+        } catch (err) {
+          if (err instanceof PromptCancelledError) {
+            continue;
+          }
+          throw err;
+        }
+        if (!confirmed) {
+          continue;
+        }
+      }
+      p.log.success(opUse(result.value));
+      return "continue";
+    }
+  }
 }
 
 async function runInteractive(migration) {
@@ -556,24 +2587,29 @@ async function runInteractive(migration) {
   } else if (migration.warning === "legacy_no_valid_rows") {
     p.log.warn("Found legacy accounts.tsv but no valid rows were imported.");
   }
+  if (migration.repair) {
+    const repairSummary = formatRepairSummary(migration.repair);
+    if (repairSummary) {
+      p.log.info(repairSummary);
+    }
+  }
+
+  await promptCurrentAuthRegistrationIfNeeded(p);
 
   while (true) {
+    const repair = repairAccountsStateOnDisk();
+    const repairSummary = formatRepairSummary(repair);
+    if (repairSummary) {
+      p.log.info(repairSummary);
+    }
+
     const active = getActive();
+    const online = await checkWifiStatus();
     const action = await promptValue(
       p,
       p.select({
-        message: active ? `Choose an action (active: ${active})` : "Choose an action",
-        options: [
-          { value: "use", label: "Use account", hint: "Set active account" },
-          { value: "switch", label: "Switch account", hint: "Interactive account picker" },
-          { value: "save", label: "Save current auth as account" },
-          { value: "add", label: "Add account from auth file" },
-          { value: "rename", label: "Rename account" },
-          { value: "swap", label: "Swap account order" },
-          { value: "remove", label: "Remove account" },
-          { value: "list", label: "List accounts" },
-          { value: "exit", label: "Exit" },
-        ],
+        message: formatMainMenuMessage(active, online),
+        options: getManualActionOptions(),
       }),
     );
 
@@ -582,193 +2618,267 @@ async function runInteractive(migration) {
       return;
     }
 
-    if (action === "list") {
-      displayAccountList(p);
-      continue;
-    }
+    if (action === "settings") {
+      const currentSettings = readCdxSettings();
+      const settingAction = await promptValue(
+        p,
+        p.select({
+          message: "CDX settings",
+          options: getSettingsMenuOptions(currentSettings),
+        }),
+      );
 
-    if (action === "use") {
-      const name = await chooseAccount(p, "Use which account?");
-      if (!name) {
+      if (settingAction === "back") {
         continue;
       }
-      p.log.success(opUse(name));
+
+      const accessMode = await promptValue(
+        p,
+        p.select({
+          message: "Default access mode",
+          initialValue: getAccessModeInitialValue(currentSettings),
+          options: getAccessModeOptions(),
+        }),
+      );
+
+      writeCdxSettings({
+        settings: {
+          ...currentSettings,
+          accessMode,
+        },
+      });
+      p.log.success(`Saved access mode '${getAccessModeLabel(accessMode)}'.`);
       continue;
     }
 
     if (action === "switch") {
-      const accounts = readAccounts();
-      if (accounts.length === 0) {
-        p.log.warn("No accounts configured.");
-        continue;
+      const browseDone = await runAccountListPicker(p);
+      if (browseDone === "exit") {
+        return;
       }
-
-      const activeName = getActive();
-      const currentIndex = accounts.findIndex((entry) => entry.name === activeName);
-      const next = currentIndex < 0 ? accounts[0].name : accounts[(currentIndex + 1) % accounts.length].name;
-      const name = await chooseAccount(p, "Switch to which account?", { initialValue: next });
-      if (!name) {
-        continue;
-      }
-      p.log.success(opUse(name));
-      continue;
-    }
-
-    if (action === "save") {
-      const name = await promptValue(
-        p,
-        p.text({
-          message: "Save current auth as",
-          placeholder: "work",
-          validate: (value) => (String(value || "").trim() ? undefined : "Name is required"),
-        }),
-      );
-      const trimmed = String(name).trim();
-      const exists = !!findAccount(readAccounts(), trimmed);
-      if (exists) {
-        const overwrite = await promptValue(
-          p,
-          p.confirm({
-            message: `Account '${trimmed}' exists. Overwrite?`,
-            initialValue: false,
-          }),
-        );
-        if (!overwrite) {
-          p.log.info("Save cancelled.");
-          continue;
-        }
-      }
-      p.log.success(opSave(trimmed));
       continue;
     }
 
     if (action === "add") {
-      const name = await promptValue(
-        p,
-        p.text({
-          message: "Account name",
-          placeholder: "personal",
-          validate: (value) => (String(value || "").trim() ? undefined : "Name is required"),
-        }),
-      );
-
-      const authPath = await promptValue(
-        p,
-        p.path({
-          message: "Path to auth.json",
-          placeholder: path.join(CODEX_HOME_DIR, "auth.json"),
-          validate: (value) => {
-            const candidate = path.resolve(String(value || ""));
-            return isRegularFile(candidate) ? undefined : "File not found";
-          },
-        }),
-      );
-
-      p.log.success(opAdd(String(name).trim(), String(authPath)));
+      await performAccountAddition(p);
+      const browseDone = await runAccountListPicker(p);
+      if (browseDone === "exit") {
+        return;
+      }
       continue;
     }
 
-    if (action === "rename") {
-      const oldName = await chooseAccount(p, "Rename which account?");
-      if (!oldName) {
-        continue;
-      }
-      const accounts = readAccounts();
-      const newName = await promptValue(
-        p,
-        p.text({
-          message: `New name for '${oldName}'`,
-          placeholder: oldName,
-          validate: (value) => {
-            const next = String(value || "").trim();
-            if (!next) {
-              return "Name is required";
+    if (action === "smart") {
+      let smartDone = false;
+      while (!smartDone) {
+        const smartAccounts = readAccounts();
+        if (smartAccounts.length === 0) {
+          p.log.warn("No accounts configured. Opening Codex login to add one.");
+          const addResult = await performAccountAddition(p);
+          if (!addResult.added) {
+            smartDone = true;
+          }
+          continue;
+        }
+
+        const activeName = getActive();
+        const { entries: keptEntries } = await fetchEntriesWithCleanup(p, smartAccounts, activeName);
+        if (keptEntries.length === 0) {
+          p.log.warn("No accounts available after cleanup. Opening Codex login to add one.");
+          const addResult = await performAccountAddition(p);
+          if (!addResult.added) {
+            smartDone = true;
+          }
+          continue;
+        }
+
+        const sortedEntries = sortEntriesByFiveHour(keptEntries);
+        const selection = buildSwitchAccountSelection(sortedEntries, activeName, "");
+        const decision = getSmartSwitchDecisionFromSelection(selection, activeName);
+        if (!decision.ok) {
+          const failureMessage = getSmartSwitchFailureMessage(decision);
+          const isExhausted = decision.reason === "all_exhausted"
+            || decision.reason === "all_unavailable_or_exhausted"
+            || decision.reason === "no_recommendation";
+          if (isExhausted) {
+            p.log.error(failureMessage);
+            p.log.info("Opening Codex login to add a fresh account.");
+            const addResult = await performAccountAddition(p);
+            if (!addResult.added) {
+              smartDone = true;
             }
-            if (next !== oldName && accounts.some((entry) => entry.name === next)) {
-              return "Account name already exists";
-            }
-            return undefined;
-          },
-        }),
-      );
-      p.log.success(opRename(oldName, String(newName).trim()));
+            continue;
+          }
+          p.log.warn(failureMessage);
+          smartDone = true;
+          continue;
+        }
+
+        const targetName = decision.to || activeName;
+        const entry = targetName ? selection.entriesByName.get(targetName) : null;
+        if (entry && statusNeedsHardWarning(entry.status)) {
+          const confirmed = await confirmDepletedSelection(p, targetName, entry.status);
+          if (!confirmed) {
+            p.log.info("Smart switch cancelled.");
+            smartDone = true;
+            continue;
+          }
+        }
+
+        if (decision.alreadyOptimal) {
+          const currentEntry = selection.entriesByName.get(activeName);
+          const lowCreditsMessage = currentEntry && statusHasLowCredits(currentEntry.status)
+            ? ` (low credits: ${getCreditBalanceLabel(currentEntry.status)})`
+            : "";
+          p.outro(`Already using smart account '${activeName}'${lowCreditsMessage}.`);
+          return;
+        }
+
+        if (entry && statusHasLowCredits(entry.status)) {
+          p.log.warn(
+            `Smart switch picked '${targetName}' with low credits (${getCreditBalanceLabel(entry.status)}).`,
+          );
+        }
+        p.outro(opUse(targetName));
+        return;
+      }
       continue;
     }
 
-    if (action === "swap") {
-      if (readAccounts().length < 2) {
-        p.log.warn("Need at least 2 accounts to swap.");
-        continue;
-      }
-      const first = await chooseAccount(p, "First account to swap");
-      if (!first) {
-        continue;
-      }
-      const second = await chooseAccount(p, "Second account to swap", {
-        disabledName: first,
-      });
-      if (!second) {
-        continue;
-      }
-      p.log.success(opSwap(first, second));
-      continue;
-    }
-
-    if (action === "remove") {
-      const name = await chooseAccount(p, "Remove which account?");
-      if (!name) {
-        continue;
-      }
-      const ok = await promptValue(
-        p,
-        p.confirm({
-          message: `Remove '${name}'?`,
-          initialValue: false,
-        }),
-      );
-      if (!ok) {
-        p.log.info("Remove cancelled.");
-        continue;
-      }
-      p.log.success(opRemove(name));
-      continue;
-    }
   }
 }
 
 async function main() {
-  const args = process.argv.slice(2);
-  if (args.length > 0) {
-    die("subcommands were removed. Run `cdx` with no arguments.");
-  }
+  const mode = decideCdxMode({
+    args: process.argv.slice(2),
+    isTTY: process.stdin.isTTY && process.stdout.isTTY,
+  });
 
-  requireTTY();
-  const migration = ensureState();
-
-  try {
-    await runInteractive(migration);
-  } catch (err) {
-    if (err instanceof PromptCancelledError) {
-      const p = await loadPrompts();
-      p.cancel("Operation cancelled");
-      process.exit(1);
+  if (mode.kind === "smart-switch-json") {
+    ensureState();
+    try {
+      const result = await runSmartSwitchOperation();
+      process.stdout.write(`${JSON.stringify(result)}\n`);
+      process.exit(
+        result.ok
+          ? 0
+          : ((result.reason === "all_exhausted" || result.reason === "all_unavailable_or_exhausted") ? 2 : 1),
+      );
+    } catch (err) {
+      die(err.message || String(err));
     }
-    die(err.message || String(err));
+    return;
   }
+
+  if (mode.kind === "manual") {
+    if (mode.forwardedArgs.length > 0) {
+      die("usage: cdx manual");
+    }
+    await runManualEntryPoint({
+      ensureState,
+      requireTTY,
+      runInteractive,
+      PromptCancelledError,
+      loadPrompts,
+      die,
+      exit: (code) => process.exit(code),
+    });
+    return;
+  }
+
+  const settings = readCdxSettings();
+  const wrapperArgs = applySavedAccessMode({
+    forwardedArgs: mode.forwardedArgs,
+    settings,
+  });
+
+  await runCodexWrapper({
+    argv: wrapperArgs,
+    mainImpl: require("./ccx.js")._internalMain,
+  });
 }
 
 module.exports = {
   _internal: {
+    resolveCdxDir,
+    getManualActionOptions,
+    getSettingsMenuOptions,
+    getAccessModeOptions,
+    getAccessModeInitialValue,
+    getAccessModeLabel,
+    hasExplicitAccessFlags,
+    applySavedAccessMode,
     ensureState,
     migrateLegacyAccountsOnce,
     parseLegacyAccountsTsv,
+    normalizeAccountEntry,
     readAccountsFromJson,
     readAccounts,
+    getActive,
+    setActive,
+    repairAccountsState,
+    repairAccountsStateOnDisk,
+    formatRepairSummary,
+    extractAccountIdFromObject,
     extractEmailFromObject,
+    extractPlanTypeFromObject,
     emailFromToken,
+    planTypeFromToken,
     decodeJwtPayload,
+    getAccountMetadata,
     getAccountEmail,
-    accountDisplayName,
+    getRateLimitWindowLabel,
+    formatResetAt,
+    createRateLimitWindowSummary,
+    createCreditsSummary,
+    createUnavailableRateLimitStatus,
+    getDepletedLimitLabels,
+    statusHasDepletedLimit,
+    statusHasZeroCredits,
+    statusHasLowCredits,
+    statusNeedsHardWarning,
+    isStatusUsableNow,
+    areAllEligibleAccountsExhausted,
+    areAllEligibleAccountsUnavailableOrExhausted,
+    getCreditBalanceLabel,
+    buildDepletedWarningMessage,
+    createAppServerRequest,
+    createAppServerNotification,
+    resolveCodexBinary,
+    getCodexLaunchSpec,
+    resolveNpmShimScript,
+    hasFreshLiveRateLimitCache,
+    getRecommendedSwitchAccount,
+    buildSwitchAccountSelection,
+    getSmartSwitchDecisionFromSelection,
+    createStatusSnapshot,
+    runSmartSwitchOperation,
+    opSave,
+    opUse,
+    opRemove,
+    opRename,
+    runAccountListPicker,
+    performAccountCleanup,
+    performAccountAddition,
+    fetchEntriesWithCleanup,
+    formatMainMenuMessage,
+    checkWifiStatus,
+    resetWifiStatusCacheForTests,
+    evaluateCurrentAuthRegistration,
+    promptCurrentAuthRegistrationIfNeeded,
+    sortEntriesByFiveHour,
+    getFirstAvailableNumericAccountName,
+    formatRateLimitHint,
+    formatFiveHourInline,
+    buildSwitchAccountLabel,
+    buildSwitchAccountHint,
+    buildSwitchAccountOptions,
+    fetchLiveRateLimitStatus,
+    getLiveRateLimitStatus,
+    setLiveRateLimitFetcherForTests,
+    setCodexAppServerQueryForTests,
+    opSetPinned,
+    opSetExcludedFromRecommendation,
   },
 };
 
